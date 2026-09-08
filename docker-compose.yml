@@ -1,19 +1,19 @@
-# Banco di prova: tre device sulla tailnet reale piu' un osservatore.
+# Test rig: three devices on the real tailnet plus one observer.
 #
-# I tre nodi non si conoscono a vicenda per configurazione: nessun
-# --bootstrap, nessun indirizzo scritto da nessuna parte. Si trovano
-# interrogando tailscaled e filtrando per prefisso di hostname.
+# The three nodes don't know about each other via configuration: no
+# --bootstrap, no address written down anywhere. They find each other by
+# querying tailscaled and filtering by hostname prefix.
 #
-# Serve una TS_AUTHKEY effimera (Admin console, Settings, Keys):
-# spunta Ephemeral, cosi' i nodi spariscono dalla tailnet quando fermi
-# il compose, e Reusable, perche' la usano tre container.
+# Needs an ephemeral TS_AUTHKEY (Admin console, Settings, Keys):
+# check Ephemeral, so nodes disappear from the tailnet when you stop
+# the compose stack, and Reusable, since three containers share it.
 
 x-node: &node
   build:
     context: .
     dockerfile: Dockerfile
   environment: &node-env
-    TS_AUTHKEY: "${TS_AUTHKEY:?serve una auth key, copia .env.example in .env}"
+    TS_AUTHKEY: "${TS_AUTHKEY:?an auth key is required, copy env.example to .env}"
     SYNCD_PORT: "47100"
   cap_add: [NET_ADMIN, NET_RAW]
   devices: ["/dev/net/tun:/dev/net/tun"]
@@ -39,7 +39,7 @@ services:
       - syncd
       - --device=device-a
       - --port=47100
-      - --peer-prefix=syncd-          # sonda solo i nodi del banco
+      - --peer-prefix=syncd-          # only probe this rig's own nodes
       - --interval=3
       - --telemetry=http://logger:9000/ev
     ports: ["47101:47100"]
@@ -76,10 +76,10 @@ services:
       - --telemetry=http://logger:9000/ev
     ports: ["47103:47100"]
 
-  # L'osservatore. Niente TS_AUTHKEY: non entra nella tailnet e non e' un
-  # peer. Raggiunge i nodi sulla rete Docker, cioe' fuori dal percorso di
-  # sync. Se lo fermi, i tre nodi continuano a sincronizzarsi: lo scenario
-  # di test lo verifica esplicitamente.
+  # The observer. No TS_AUTHKEY: it doesn't join the tailnet and isn't a
+  # peer. It reaches the nodes over the Docker network, i.e. outside the
+  # sync path. Stopping it doesn't stop the three nodes from syncing: the
+  # test scenario checks this explicitly.
   logger:
     build:
       context: .

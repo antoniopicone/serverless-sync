@@ -1,13 +1,13 @@
-//! logger — osservatore del banco di prova.
+//! logger — observer for the test rig.
 //!
-//! NON e' un peer e NON sta nel percorso di sync. Fa due cose:
-//!   1. riceve eventi in push dai nodi (POST /ev) per la timeline;
-//!   2. interroga /v1/state di ogni nodo per il fingerprint autoritativo.
+//! NOT a peer and NOT in the sync path. It does two things:
+//!   1. receives events pushed from the nodes (POST /ev) for the timeline;
+//!   2. polls each node's /v1/state for the authoritative fingerprint.
 //!
-//! Il fingerprint e' il semaforo: uguale su tutti i nodi vuol dire che le
-//! repliche sono allineate, diverso vuol dire che il merge e' divergente.
-//! GET /api/assert restituisce 200 se convergono e 409 se no, cosi' lo
-//! script di scenario puo' fallire con un exit code invece che a occhio.
+//! The fingerprint is the signal: the same across all nodes means replicas
+//! are aligned, different means the merge has diverged. GET /api/assert
+//! returns 200 if converged and 409 if not, so the test scenario script
+//! can fail with an exit code instead of by eyeballing it.
 
 use axum::{
     extract::{Path, State},
@@ -39,10 +39,10 @@ struct DeviceState {
     entries: Vec<serde_json::Value>,
     vv: serde_json::Value,
     reachable: bool,
-    /// Stato dell'interruttore locale (v. /v1/online sul nodo), non la
-    /// raggiungibilita': un dispositivo puo' essere "offline" e restare
-    /// perfettamente raggiungibile e editabile in locale — e' il punto
-    /// della demo. Solo la sua sync verso gli altri si ferma.
+    /// State of the local switch (see /v1/online on the node), not
+    /// reachability: a device can be "offline" and stay perfectly
+    /// reachable and editable locally — that's the whole point of the
+    /// demo. Only its sync toward the others stops.
     online: bool,
     last_seen: u64,
 }
@@ -52,14 +52,14 @@ struct Inner {
     events: VecDeque<Event>,
     seq: u64,
     devices: BTreeMap<String, DeviceState>,
-    /// target di polling -> nome del device, imparato al primo poll riuscito.
-    /// Serve per attribuire correttamente un fallimento: senza, un nodo che
-    /// smette di rispondere resta marcato raggiungibile e la partizione
-    /// non si vede.
+    /// polling target -> device name, learned on the first successful
+    /// poll. Needed to correctly attribute a failure: without it, a node
+    /// that stops responding stays marked reachable and the partition
+    /// doesn't show up.
     by_target: BTreeMap<String, String>,
-    /// L'inverso: nome del device -> target di rete. La UI parla solo col
-    /// logger (niente CORS verso le porte dei nodi); write e toggle online
-    /// vengono inoltrati al target giusto passando da qui.
+    /// The reverse: device name -> network target. The UI only talks to
+    /// the logger (no CORS to configure on the nodes' ports); writes and
+    /// online toggles get forwarded to the right target through this map.
     target_of: BTreeMap<String, String>,
 }
 
@@ -101,18 +101,18 @@ async fn ingest(State(l): State<Log>, Json(ev): Json<EvIn>) -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
-/// Verde solo se TUTTI i nodi conosciuti rispondono e hanno lo stesso
-/// fingerprint.
+/// Green only if ALL known nodes respond and share the same fingerprint.
 ///
-/// La sfumatura conta. Se un nodo e' sospeso e ci si limita a guardare
-/// quelli vivi, i due rimasti concordano e il semaforo diventa verde in
-/// piena partizione: una convergenza che non c'e'. Un nodo che non
-/// risponde e' uno stato ignoto, non uno stato d'accordo. Per questo
-/// `live_aligned` resta esposto a parte: dice se il sottoinsieme
-/// raggiungibile e' coerente, che e' un'informazione diversa.
+/// The nuance matters. If a node is suspended and you only look at the
+/// ones still alive, the remaining two agree with each other and the
+/// signal would go green in the middle of a partition: a convergence that
+/// isn't real. A node that doesn't answer is an unknown state, not an
+/// agreeing one. That's why `live_aligned` is exposed separately: it
+/// reports whether the reachable subset is at least internally
+/// consistent, which is a different piece of information.
 fn converged(devs: &BTreeMap<String, DeviceState>) -> (bool, bool, String) {
     if devs.is_empty() {
-        return (false, false, "nessun nodo ancora visto".into());
+        return (false, false, "no node seen yet".into());
     }
     let live: Vec<&DeviceState> = devs.values().filter(|d| d.reachable).collect();
     let live_aligned = live.len() >= 2
@@ -124,16 +124,16 @@ fn converged(devs: &BTreeMap<String, DeviceState>) -> (bool, bool, String) {
         .collect();
     if !down.is_empty() {
         return (false, live_aligned,
-            format!("non raggiungibile: {} — {}", down.join(", "),
-                if live_aligned { "i nodi vivi sono allineati fra loro" }
-                else { "e i nodi vivi non sono allineati" }));
+            format!("unreachable: {} — {}", down.join(", "),
+                if live_aligned { "live nodes are aligned with each other" }
+                else { "and live nodes are not aligned" }));
     }
     if devs.len() < 2 {
-        return (false, false, "un solo nodo: niente da far convergere".into());
+        return (false, false, "only one node: nothing to converge".into());
     }
     let first = &devs.values().next().unwrap().fingerprint;
     if devs.values().all(|d| &d.fingerprint == first) {
-        (true, true, format!("{} nodi allineati su {}", devs.len(), first))
+        (true, true, format!("{} nodes aligned on {}", devs.len(), first))
     } else {
         let diff: Vec<String> = devs.values()
             .map(|d| format!("{}={}", d.device, d.fingerprint))
@@ -161,8 +161,9 @@ async fn api_assert(State(l): State<Log>) -> impl IntoResponse {
     (code, Json(json!({ "converged": ok, "live_aligned": live_aligned, "detail": detail })))
 }
 
-/// Interroga /v1/state di ogni nodo. Il logger e' l'unico che parla con
-/// tutti: i nodi non sanno che esiste, oltre a spedirgli eventi alla cieca.
+/// Polls /v1/state on every node. The logger is the only thing that talks
+/// to all of them: the nodes don't know it exists, beyond blindly getting
+/// events pushed at them.
 async fn poller(l: Log) {
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(900))
@@ -170,8 +171,8 @@ async fn poller(l: Log) {
         .unwrap();
     loop {
         for t in &l.targets {
-            // tutta la parte di rete PRIMA di prendere il lock: tenere un
-            // MutexGuard attraverso un await bloccherebbe l'intero logger
+            // all the network work BEFORE taking the lock: holding a
+            // MutexGuard across an await would block the whole logger
             let fetched: Option<serde_json::Value> = match http
                 .get(format!("http://{t}/v1/state"))
                 .send()
@@ -201,8 +202,8 @@ async fn poller(l: Log) {
                     );
                 }
                 None => {
-                    // marca irraggiungibile senza cancellarlo: durante una
-                    // partizione vuoi ancora vedere il suo ultimo fingerprint
+                    // mark unreachable without deleting it: during a
+                    // partition you still want to see its last fingerprint
                     if let Some(name) = g.by_target.get(t).cloned() {
                         if let Some(d) = g.devices.get_mut(&name) {
                             d.reachable = false;
@@ -219,9 +220,9 @@ async fn index() -> Html<&'static str> {
     Html(UI)
 }
 
-/// Inoltra un comando di un dispositivo verso il suo nodo, sulla rete
-/// Docker interna. La UI parla solo col logger: niente CORS da configurare
-/// sui nodi, e le porte dei device restano un dettaglio implementativo.
+/// Forwards a device command to its node, over the internal Docker
+/// network. The UI only talks to the logger: no CORS to configure on the
+/// nodes, and the devices' ports stay an implementation detail.
 async fn proxy_post(l: &Log, id: &str, path: &str, body: serde_json::Value) -> Response {
     let target = { l.inner.lock().unwrap().target_of.get(id).cloned() };
     let Some(target) = target else { return StatusCode::NOT_FOUND.into_response() };
@@ -275,14 +276,14 @@ async fn main() {
         .route("/api/devices/:id/online", post(device_online))
         .with_state(log);
 
-    println!("logger su :{port}, osservo {}", targets.join(" "));
+    println!("logger on :{port}, watching {}", targets.join(" "));
     let l = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
     axum::serve(l, app).await.unwrap();
 }
 
 const UI: &str = r##"<!doctype html>
-<html lang="it"><head><meta charset="utf-8">
-<title>syncd — banco di prova</title>
+<html lang="en"><head><meta charset="utf-8">
+<title>syncd — test rig</title>
 <style>
   :root { --ink:#14181C; --muted:#667079; --line:#C9CFD3; --teal:#1B5E7E;
           --band:#DCEAF0; --paper:#F5F6F4; --warn:#8C5A20; --bad:#A03232; }
@@ -359,17 +360,17 @@ const UI: &str = r##"<!doctype html>
   .who { display:inline-block; min-width:78px; font-weight:600; }
 </style></head><body>
 <header>
-  <h1>syncd — banco di prova</h1>
-  <div class="sub">Ogni card e' un dispositivo indipendente: modifica le sue voci, spegnilo, e vedi come lavora in locale finche' non torna online. Il logger osserva soltanto: se lo spegni, i nodi continuano a sincronizzarsi da soli.</div>
+  <h1>syncd — test rig</h1>
+  <div class="sub">Each card is an independent device: edit its entries, turn it off, and watch it work locally until it comes back online. The logger only observes: turn it off and the nodes keep syncing on their own.</div>
 </header>
-<div id="verdict"><div class="big">in attesa dei nodi…</div><div class="det"></div></div>
+<div id="verdict"><div class="big">waiting for nodes…</div><div class="det"></div></div>
 <main>
   <section>
-    <h2>Dispositivi</h2>
+    <h2>Devices</h2>
     <div class="devices" id="devs"></div>
   </section>
   <section>
-    <h2>Eventi</h2>
+    <h2>Events</h2>
     <ul class="ev" id="evs"></ul>
   </section>
 </main>
@@ -399,19 +400,18 @@ async function setOnline(device, online) {
   tick();
 }
 
-// Mentre l'utente sta scrivendo in un campo testo non tocchiamo QUELLA card:
-// altrimenti il poll ogni secondo gli strapperebbe il focus da sotto le
-// dita. E' per-dispositivo apposta, non globale: se e' solo la card di
-// device-c ad avere il focus, device-a e device-b devono continuare ad
-// aggiornarsi — altrimenti resterebbero visivamente fermi a un istantanea
-// vecchia (e magari non ancora convergente) anche se sul serio hanno gia'
-// finito di sincronizzarsi. Lo switch online/offline resta escluso apposta:
-// e' un click singolo, non una digitazione.
+// While the user is typing in a text field, don't touch THAT card:
+// otherwise the poll every second would rip focus out from under their
+// fingers. This is deliberately per-device, not global: if only device-c's
+// card has focus, device-a and device-b must keep updating — otherwise
+// they'd sit frozen on an old (and maybe not-yet-converged) snapshot even
+// though they've genuinely already finished syncing. The online/offline
+// switch is deliberately excluded: it's a single click, not typing.
 const EDITABLE = '.v-input, .new-k, .new-v';
 let focusedDevice = null;
-// .new-k/.new-v non portano data-device: sta sul <form class="add-form"> che
-// li contiene, quindi si risale con closest (che copre anche .v-input, che
-// invece ce l'ha gia' su di se').
+// .new-k/.new-v don't carry data-device: it's on the <form class="add-form">
+// that contains them, so we walk up with closest (which also covers
+// .v-input, which already has it on itself).
 document.addEventListener('focusin', e => {
   if (e.target.matches(EDITABLE)) focusedDevice = e.target.closest('[data-device]')?.dataset.device ?? null;
 });
@@ -419,12 +419,13 @@ document.addEventListener('focusout', e => { if (e.target.matches(EDITABLE)) foc
 
 const devs = document.getElementById('devs');
 
-// Il valore al momento del focus: senza confrontarlo con quello al blur, ogni
-// campo cliccato (anche solo per guardarlo, senza modificarlo) reinvierebbe
-// una scrittura col valore che aveva in quel momento. Se quel valore era
-// ancora quello vecchio (perche' la sync da un altro dispositivo non era
-// ancora arrivata), quella scrittura fantasma vince la corsa LWW — e' piu'
-// recente — e annulla in silenzio l'aggiornamento appena propagato altrove.
+// The value at the moment of focus: without comparing it to the value at
+// blur, every field that gets clicked (even just to look at it, without
+// changing it) would resend a write with whatever value it held at that
+// moment. If that value was still the old one (because sync from another
+// device hadn't arrived yet), that phantom write wins the LWW race — it's
+// more recent — and silently undoes the update that had just propagated
+// elsewhere.
 devs.addEventListener('focusin', e => {
   if (e.target.matches('.v-input')) e.target.dataset.orig = e.target.value;
 });
@@ -463,11 +464,11 @@ function renderCard(d) {
       <input class="v-input" data-device="${escAttr(d.device)}" data-entity="${escAttr(e.entity)}"
              value="${escAttr(e.value ?? '')}" ${d.reachable ? '' : 'disabled'} />
       <button class="del-btn" data-device="${escAttr(d.device)}" data-entity="${escAttr(e.entity)}"
-              title="elimina" ${d.reachable ? '' : 'disabled'}>×</button>
-    </div>`).join('') || '<div class="empty">nessuna voce</div>';
+              title="delete" ${d.reachable ? '' : 'disabled'}>×</button>
+    </div>`).join('') || '<div class="empty">no entries</div>';
 
   const dot = !d.reachable ? 'bad' : (!d.online ? 'warn' : '');
-  const status = !d.reachable ? 'non raggiungibile' : (d.online ? 'online' : 'offline · lavora in locale');
+  const status = !d.reachable ? 'unreachable' : (d.online ? 'online' : 'offline · working locally');
 
   return `
     <div class="card ${cls}" data-device="${escAttr(d.device)}">
@@ -482,19 +483,19 @@ function renderCard(d) {
       <div class="meta"><span class="dot ${dot}"></span>${status}<span class="fp">${esc(d.fingerprint || '—')}</span></div>
       <div class="kv-list">${rows}</div>
       <form class="add-form" data-device="${escAttr(d.device)}">
-        <input class="new-k" placeholder="chiave" ${d.reachable ? '' : 'disabled'} />
-        <input class="new-v" placeholder="valore" ${d.reachable ? '' : 'disabled'} />
+        <input class="new-k" placeholder="key" ${d.reachable ? '' : 'disabled'} />
+        <input class="new-v" placeholder="value" ${d.reachable ? '' : 'disabled'} />
         <button type="submit" ${d.reachable ? '' : 'disabled'}>+</button>
       </form>
     </div>`;
 }
 
-// Aggiorna ogni card indipendentemente: sostituisce solo quelle diverse
-// dalla card che ha il focus in questo momento, cosi' un dispositivo in
-// modifica non blocca la vista sugli altri due.
+// Updates each card independently: only replaces the ones other than the
+// card currently focused, so editing one device doesn't block the view of
+// the other two.
 function syncDevices(devices) {
   if (devices.length === 0) {
-    if (!focusedDevice) devs.innerHTML = '<div class="empty">nessun dispositivo</div>';
+    if (!focusedDevice) devs.innerHTML = '<div class="empty">no devices</div>';
     return;
   }
   for (const d of devices) {
@@ -512,8 +513,8 @@ async function tick(){
   const v = document.getElementById('verdict');
   v.className = s.converged ? '' : 'bad';
   v.querySelector('.big').textContent = s.converged
-      ? 'Repliche allineate'
-      : (s.live_aligned ? 'Allineate, ma un nodo non risponde' : 'Repliche non allineate');
+      ? 'Replicas aligned'
+      : (s.live_aligned ? 'Aligned, but one node is not responding' : 'Replicas not aligned');
   v.querySelector('.det').textContent = s.detail;
 
   syncDevices(s.devices);
@@ -521,13 +522,13 @@ async function tick(){
   document.getElementById('evs').innerHTML = s.events.map(e => {
     const warn = (e.kind === 'peer.unreachable') ? ' warn' : '';
     let d = '';
-    if (e.kind === 'sync.ok') d = `+${e.data.pulled} ricevuti, +${e.data.pushed} inviati  da ${e.data.peer}`;
+    if (e.kind === 'sync.ok') d = `+${e.data.pulled} received, +${e.data.pushed} sent  from ${e.data.peer}`;
     else if (e.kind === 'op.local') d = `${e.data.entity}  seq ${e.data.seq}`;
-    else if (e.kind === 'state') d = `${e.data.fingerprint}  (${e.data.entries} voci)`;
+    else if (e.kind === 'state') d = `${e.data.fingerprint}  (${e.data.entries} entries)`;
     else if (e.kind === 'peer.unreachable') d = e.data.peer;
     else if (e.kind === 'node.start') d = e.data.advertise || '';
-    else if (e.kind === 'node.online') d = 'torna online';
-    else if (e.kind === 'node.offline') d = 'passa offline, lavora in locale';
+    else if (e.kind === 'node.online') d = 'back online';
+    else if (e.kind === 'node.offline') d = 'goes offline, working locally';
     else d = JSON.stringify(e.data);
     return `<li><span class="who">${esc(e.device)}</span><span class="k${warn}">${esc(e.kind)}</span><span class="d">${esc(d)}</span></li>`;
   }).join('');

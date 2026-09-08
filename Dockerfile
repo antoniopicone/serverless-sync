@@ -1,6 +1,6 @@
-# syncd — immagine unica per i nodi e per il logger.
-# I nodi eseguono anche tailscaled; il logger usa la stessa immagine ma non
-# entra nella tailnet (parla con i nodi sulla rete Docker, fuori banda).
+# syncd — single image for both the nodes and the logger.
+# Nodes also run tailscaled; the logger uses the same image but doesn't
+# join the tailnet (it talks to nodes over the Docker network, out of band).
 
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Avvia tailscaled solo se c'e' una TS_AUTHKEY. Il logger parte senza,
-# e resta fuori dalla tailnet: e' un osservatore, non un peer.
+# Starts tailscaled only if a TS_AUTHKEY is set. The logger starts without
+# one and stays off the tailnet: it's an observer, not a peer.
 set -e
 
 if [ -n "${TS_AUTHKEY:-}" ]; then
@@ -8,11 +8,11 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
   tailscaled --state=/var/lib/tailscale/tailscaled.state \
              --socket=/var/run/tailscale/tailscaled.sock &
 
-  # --accept-dns=false e' obbligatorio qui.
-  # tailscaled riscriverebbe /etc/resolv.conf verso MagicDNS (100.100.100.100)
-  # e il container smetterebbe di risolvere i nomi della rete Docker: i nodi
-  # non troverebbero piu' "logger". La discovery non ne ha bisogno, perche'
-  # usa gli IP 100.x letti da `tailscale status --json`, non i nomi.
+  # --accept-dns=false is mandatory here.
+  # tailscaled would rewrite /etc/resolv.conf toward MagicDNS (100.100.100.100)
+  # and the container would stop resolving Docker-network names: nodes
+  # would no longer find "logger". Discovery doesn't need it anyway, since
+  # it reads the 100.x addresses from `tailscale status --json`, not names.
   tailscale up \
     --authkey="${TS_AUTHKEY}" \
     --hostname="${TS_HOSTNAME:-syncd-node}" \
@@ -22,7 +22,7 @@ if [ -n "${TS_AUTHKEY:-}" ]; then
 
   echo "tailnet: $(tailscale ip -4)  hostname=${TS_HOSTNAME:-syncd-node}"
 
-  # il nodo si annuncia nel peer exchange con il suo IP tailnet
+  # the node announces itself in the peer exchange with its tailnet IP
   SYNCD_ADVERTISE="$(tailscale ip -4 | head -1):${SYNCD_PORT:-47100}"
   export SYNCD_ADVERTISE
 fi

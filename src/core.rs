@@ -1,18 +1,17 @@
-//! CRDT di esempio: registro LWW (last-writer-wins) per entita'.
+//! Example CRDT: an LWW (last-writer-wins) register per entity.
 //!
-//! Punto di innesto dell'applicazione (vedi README.md): quando si sostituisce
-//! il key/value fittizio con la logica vera, `apply` e `local_change` sono
-//! le uniche due funzioni da riscrivere. Il resto del banco (rete, discovery,
-//! anti-entropy) non sa cosa contiene un `Op`.
+//! Application insertion point (see README.md): when the fake key/value
+//! store is replaced with real logic, `apply` and `local_change` are the
+//! only two functions to rewrite. The rest of the rig (network, discovery,
+//! anti-entropy) doesn't know what an `Op` contains.
 //!
-//! Il tie-break dei conflitti usa un HLC (hybrid logical clock): timestamp
-//! fisico + contatore logico + device_id. Il device_id nel confronto e'
-//! obbligatorio, non un dettaglio: senza, due device con lo stesso
-//! timestamp fisico potrebbero scegliere vincitori diversi e divergere in
-//! silenzio. Con l'ordine totale (time, counter, device_id) tutti i
-//! repliche convergono sullo stesso risultato indipendentemente dall'ordine
-//! di applicazione — la proprieta' che rende `apply` idempotente e
-//! commutativa.
+//! Conflict tie-break uses an HLC (hybrid logical clock): physical
+//! timestamp + logical counter + device_id. The device_id in the
+//! comparison is mandatory, not a detail: without it, two devices with the
+//! same physical timestamp could pick different winners and diverge
+//! silently. With the total order (time, counter, device_id) every
+//! replica converges on the same result regardless of application order —
+//! the property that makes `apply` idempotent and commutative.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -81,8 +80,8 @@ impl Replica {
         }
     }
 
-    /// Avanza l'HLC locale: mai indietro rispetto al wall clock ne' rispetto
-    /// all'ultimo tick emesso da questo device.
+    /// Advances the local HLC: never goes backward relative to the wall
+    /// clock nor to the last tick this device emitted.
     fn tick(&mut self) -> Hlc {
         let wall = now_millis();
         if wall > self.hlc_time {
@@ -94,9 +93,9 @@ impl Replica {
         Hlc { time: self.hlc_time, counter: self.hlc_counter }
     }
 
-    /// Osserva l'HLC di un op remoto, cosi' il clock locale non resta mai
-    /// indietro rispetto a quanto gia' visto: e' quello che garantisce che i
-    /// prossimi op locali dominino causalmente quelli appena ricevuti.
+    /// Observes a remote op's HLC, so the local clock never falls behind
+    /// what it has already seen: this is what guarantees the next local
+    /// ops causally dominate the ones just received.
     fn observe(&mut self, other: Hlc) {
         let wall = now_millis();
         if other.time > self.hlc_time.max(wall) {
@@ -127,14 +126,14 @@ impl Replica {
         op
     }
 
-    /// La regola di merge. Idempotente (riapplicare lo stesso op non cambia
-    /// nulla oltre alla prima volta) e commutativa (l'ordine di arrivo non
-    /// conta): entrambe derivano dal confronto totalmente ordinato
-    /// (hlc, device) invece che dall'ordine di apply.
+    /// The merge rule. Idempotent (reapplying the same op changes nothing
+    /// past the first time) and commutative (arrival order doesn't
+    /// matter): both follow from comparing the totally ordered
+    /// (hlc, device) pair instead of relying on apply order.
     pub fn apply(&mut self, op: Op) -> bool {
         let last = self.vv.get(&op.device).copied().unwrap_or(0);
         if op.seq <= last {
-            return false; // gia' visto: idempotenza
+            return false; // already seen: idempotence
         }
         self.observe(op.hlc);
         self.merge_entry(&op);
@@ -166,7 +165,7 @@ impl Replica {
         self.vv.clone()
     }
 
-    /// Op non ancora visti dal chiamante, dato il suo version vector.
+    /// Ops the caller hasn't seen yet, given its version vector.
     pub fn ops_since(&self, vv: &VersionVector) -> Vec<Op> {
         self.log
             .iter()
@@ -183,11 +182,11 @@ impl Replica {
             .collect()
     }
 
-    /// Hash deterministico dello stato visibile (entita' vive con il loro
-    /// valore). E' il semaforo che il logger usa per decidere se le repliche
-    /// sono allineate: due repliche con lo stesso stato devono produrre
-    /// sempre lo stesso fingerprint, indipendentemente dall'ordine in cui
-    /// hanno applicato gli op.
+    /// Deterministic hash of the visible state (live entities with their
+    /// value). This is the signal the logger uses to decide whether
+    /// replicas are aligned: two replicas with the same state must always
+    /// produce the same fingerprint, regardless of the order in which they
+    /// applied their ops.
     pub fn state_fingerprint(&self) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};

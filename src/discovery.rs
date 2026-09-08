@@ -1,12 +1,12 @@
 //! Discovery via tailnet + peer exchange.
 //!
-//! Non sa nulla del contenuto degli `Op` (vedi core.rs): per questo modulo
-//! un peer e' solo un indirizzo. Due fonti si sommano:
-//!   1. `tailscale status --json`, che trova gli altri nodi della tailnet
-//!      reale filtrando per prefisso di hostname (--peer-prefix);
-//!   2. il PEX bidirezionale scambiato a ogni round di sync, che serve ai
-//!      client (es. iOS) che non vedono tailscaled e imparano la mesh
-//!      chiedendo a un peer qualsiasi.
+//! Knows nothing about what an `Op` contains (see core.rs): to this
+//! module a peer is just an address. Two sources add up:
+//!   1. `tailscale status --json`, which finds other nodes on the real
+//!      tailnet by filtering on hostname prefix (--peer-prefix);
+//!   2. the bidirectional PEX exchanged on every sync round, which lets
+//!      clients (e.g. iOS) that can't see tailscaled learn the mesh by
+//!      asking any single peer.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -30,9 +30,9 @@ pub struct NodeInfo {
     pub services: BTreeMap<String, u16>,
 }
 
-/// Directory condivisa di peer conosciuti, appresa via peer exchange.
-/// Nessuna autorita': e' solo cache, per questo l'interior mutability
-/// basta e i metodi prendono `&self`.
+/// Shared directory of known peers, learned via peer exchange. No
+/// authority: it's just a cache, which is why interior mutability is
+/// enough and the methods take `&self`.
 #[derive(Clone, Default)]
 pub struct PexCache {
     inner: Arc<Mutex<BTreeMap<String, Peer>>>,
@@ -68,14 +68,14 @@ fn ipv4_of(node: &serde_json::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Il proprio IP tailnet (100.x.y.z), se tailscaled e' su e connesso.
+/// This node's own tailnet IP (100.x.y.z), if tailscaled is up and connected.
 pub fn my_tailnet_ip() -> Option<String> {
     let status = tailscale_status_json()?;
     ipv4_of(status.get("Self")?)
 }
 
-/// Altri nodi della tailnet il cui hostname inizia per `peer_prefix`.
-/// Prefisso vuoto = nessun filtro. Ritorna (hostname, ip).
+/// Other tailnet nodes whose hostname starts with `peer_prefix`.
+/// Empty prefix = no filter. Returns (hostname, ip).
 pub fn tailnet_candidates(peer_prefix: &str) -> Vec<(String, String)> {
     let Some(status) = tailscale_status_json() else { return Vec::new() };
     let Some(peers) = status.get("Peer").and_then(|p| p.as_object()) else { return Vec::new() };
@@ -83,11 +83,12 @@ pub fn tailnet_candidates(peer_prefix: &str) -> Vec<(String, String)> {
     peers
         .values()
         .filter_map(|node| {
-            // Un device ephemeral riavviato con lo stesso hostname lascia
-            // per un po' il vecchio nodo nella tailnet, offline. Se non lo
-            // scartiamo qui, il suo IP morto resta un target: senza timeout
-            // sul client di sync basterebbe a bloccare il giro di
-            // anti-entropy abbastanza da far slittare la sync coi peer vivi.
+            // An ephemeral device restarted with the same hostname leaves
+            // its old node lingering on the tailnet, offline, for a while.
+            // If we don't filter it out here, its dead IP stays a sync
+            // target: without a timeout on the sync client that alone
+            // would be enough to block the anti-entropy round long enough
+            // to delay syncing with live peers.
             if !node.get("Online").and_then(|v| v.as_bool()).unwrap_or(false) {
                 return None;
             }

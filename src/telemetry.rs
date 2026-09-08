@@ -1,10 +1,10 @@
-//! Telemetria verso il logger.
+//! Telemetry toward the logger.
 //!
-//! Fire-and-forget, FUORI dal percorso di sync: un errore qui non deve mai
-//! influenzare la convergenza. Se il logger e' spento i nodi non se ne
-//! accorgono — ed e' una proprieta' che lo scenario di test verifica
-//! esplicitamente, perche' un osservatore che diventa una dipendenza e'
-//! esattamente il punto centrale che questa architettura nega.
+//! Fire-and-forget, OUTSIDE the sync path: an error here must never
+//! affect convergence. If the logger is off, nodes don't notice — a
+//! property the test scenario checks explicitly, because an observer that
+//! becomes a dependency is exactly the central point this architecture
+//! denies.
 
 use serde_json::json;
 
@@ -24,7 +24,7 @@ impl Telemetry {
         Self { url, device, http }
     }
 
-    /// Non attende la risposta e ignora ogni errore, per costruzione.
+    /// Doesn't wait for the response and ignores every error, by design.
     pub fn emit(&self, kind: &str, data: serde_json::Value) {
         let Some(url) = self.url.clone() else { return };
         let body = json!({

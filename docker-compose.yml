@@ -1,0 +1,98 @@
+# Banco di prova: tre device sulla tailnet reale piu' un osservatore.
+#
+# I tre nodi non si conoscono a vicenda per configurazione: nessun
+# --bootstrap, nessun indirizzo scritto da nessuna parte. Si trovano
+# interrogando tailscaled e filtrando per prefisso di hostname.
+#
+# Serve una TS_AUTHKEY effimera (Admin console, Settings, Keys):
+# spunta Ephemeral, cosi' i nodi spariscono dalla tailnet quando fermi
+# il compose, e Reusable, perche' la usano tre container.
+
+x-node: &node
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: &node-env
+    TS_AUTHKEY: "${TS_AUTHKEY:?serve una auth key, copia .env.example in .env}"
+    SYNCD_PORT: "47100"
+  cap_add: [NET_ADMIN, NET_RAW]
+  devices: ["/dev/net/tun:/dev/net/tun"]
+  networks: [bench]
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:47100/v1/node"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 20s
+
+services:
+
+  device-a:
+    <<: *node
+    container_name: syncd-device-a
+    hostname: syncd-a
+    environment:
+      <<: *node-env
+      TS_HOSTNAME: syncd-a
+    command:
+      - syncd
+      - --device=device-a
+      - --port=47100
+      - --peer-prefix=syncd-          # sonda solo i nodi del banco
+      - --interval=3
+      - --telemetry=http://logger:9000/ev
+    ports: ["47101:47100"]
+
+  device-b:
+    <<: *node
+    container_name: syncd-device-b
+    hostname: syncd-b
+    environment:
+      <<: *node-env
+      TS_HOSTNAME: syncd-b
+    command:
+      - syncd
+      - --device=device-b
+      - --port=47100
+      - --peer-prefix=syncd-
+      - --interval=3
+      - --telemetry=http://logger:9000/ev
+    ports: ["47102:47100"]
+
+  device-c:
+    <<: *node
+    container_name: syncd-device-c
+    hostname: syncd-c
+    environment:
+      <<: *node-env
+      TS_HOSTNAME: syncd-c
+    command:
+      - syncd
+      - --device=device-c
+      - --port=47100
+      - --peer-prefix=syncd-
+      - --interval=3
+      - --telemetry=http://logger:9000/ev
+    ports: ["47103:47100"]
+
+  # L'osservatore. Niente TS_AUTHKEY: non entra nella tailnet e non e' un
+  # peer. Raggiunge i nodi sulla rete Docker, cioe' fuori dal percorso di
+  # sync. Se lo fermi, i tre nodi continuano a sincronizzarsi: lo scenario
+  # di test lo verifica esplicitamente.
+  logger:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: syncd-logger
+    command: ["logger"]
+    environment:
+      DEVICES: "device-a:47100,device-b:47100,device-c:47100"
+      PORT: "9000"
+    ports: ["9000:9000"]
+    networks: [bench]
+    restart: unless-stopped
+
+networks:
+  bench:
+    driver: bridge

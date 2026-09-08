@@ -1,0 +1,118 @@
+# Docker Compose Test Rig
+
+Three devices on your real tailnet plus one observer. No addresses configured: nodes find each other by querying `tailscaled`.
+
+```
+docker-compose.yml     3 nodes + logger
+Dockerfile              single image, two binaries
+docker/entrypoint.sh    starts tailscaled if a TS_AUTHKEY is set
+scenario.sh             test sequence with automatic assertions
+```
+
+## Start
+
+```bash
+cp env.example .env       # put your auth key in here
+docker compose up -d --build
+open http://localhost:9000
+```
+
+The auth key must be generated from the Admin console (Settings → Keys) as **Reusable** (three containers share it) and **Ephemeral** (nodes disappear from the tailnet when you stop the compose stack, instead of piling up).
+
+Ports: `47101`, `47102`, `47103` for the three devices, `9000` for the logger.
+
+```bash
+./scenario.sh    # exits non-zero if a phase fails
+```
+
+## What you see at :9000
+
+Each card is one device you can act on directly: edit its key/value entries inline, add or delete a key, and flip it offline with the switch. Offline doesn't mean disconnected from the UI — it means the device keeps reading and writing locally while its peer-to-peer sync simply stops, so you can watch it diverge, then flip it back online and watch it reconverge on its own, no manual reconciliation.
+
+The banner at the top is the **fingerprint**: a hash of the replicated state. If it matches across all nodes the replicas are aligned; if it stays different, the merge has diverged and the problem is in the CRDT, not the network. Below the cards, a live event feed scrolls: `op.local`, `sync.ok`, `peer.unreachable`, `node.online`/`node.offline`.
+
+Green requires **every** node to respond and agree. The nuance matters: if a node is suspended and you only look at the ones still alive, the remaining two agree with each other and the banner would go green in the middle of a partition — a convergence that isn't real. A node that doesn't answer is an unknown state, not an agreeing one. The `live_aligned` field in `/api/state` reports separately whether the reachable subset is at least internally consistent.
+
+## Two non-obvious choices
+
+**`--accept-dns=false` is mandatory.** Without it, `tailscaled` rewrites `/etc/resolv.conf` toward MagicDNS and the container stops resolving Docker-network names: nodes would no longer find `logger`. Discovery doesn't need it anyway, since it reads the `100.x` addresses straight out of `tailscale status --json`.
+
+**`--peer-prefix=syncd-`.** Without a filter, every node would probe *every* device on your tailnet — laptop, phone, Raspberry Pi — on every round. The hostname filter is a test-rig shortcut: in production the real filter is the roster of authorized devices, not the name.
+
+## The logger is not in the sync path
+
+It has no `TS_AUTHKEY`, doesn't join the tailnet, isn't a peer. It receives pushed events from the nodes (fire-and-forget, short timeout, every error ignored) and polls each node's `/v1/state` and edit endpoints over the Docker network.
+
+I ruled out the two alternatives for a specific reason. A fourth peer that quietly syncs would see the ops but not the exchanges between the other three. A proxy sitting in the traffic path would introduce exactly the central point this architecture denies, and would skew the timings you're trying to measure.
+
+Phase 5 of the scenario turns the logger off, writes to a node, and checks that the three still converge. An observer that becomes a dependency is a bug in the observer.
+
+## Where your application plugs in
+
+The service running in the containers is a fake key/value store. The insertion point is `src/core.rs`, and only that:
+
+```rust
+pub fn apply(&mut self, op: Op) -> bool     // the merge rule
+pub fn local_change(&mut self, ...) -> Op   // user edit -> op
+```
+
+`discovery.rs` and `main.rs` don't know what an `Op` contains: to them, its payload is an opaque blob. When your real data model replaces the key/value store, only the reduce function and the payload shape change — not the transport, not the discovery.
+
+Two constraints to respect when you replace the reducer, or the rig will go red without telling you why:
+
+- `apply` must stay **idempotent and commutative**. The same op applied twice, or ops applied out of order, must yield the same state. That's what lets the network layer skip guaranteeing either ordering or exactly-once delivery.
+- the conflict tie-break must stay **deterministic**. The HLC includes the `device_id` for exactly this reason: two devices with the same timestamp must pick the same winner, or they diverge silently.
+
+If you change `core.rs`, change the equivalent client-side reducer in parallel. They're the same rule written twice, and that's where divergence hides most easily. The fingerprint exists so you notice immediately.
+
+## Integrating this layer into your own Rust application
+
+This rig is really three independent pieces wired together in `main.rs`. Each one stands on its own:
+
+- **`src/core.rs`** — the CRDT reducer: `Replica`, `Op`, `OpKind`, `VersionVector`, HLC-based deterministic conflict resolution. Self-contained; it has no dependency on HTTP, tailscale, or the key/value shape this demo happens to use.
+- **`src/discovery.rs`** — peer discovery over a tailnet via `tailscale status --json`, plus a bidirectional peer-exchange (PEX) cache. Entirely optional — swap it for whatever already tells your app where its peers are.
+- **The wire protocol** — a handful of HTTP endpoints two replicas use to reconcile state. Framework-agnostic: this demo happens to use axum, but the shapes below are plain JSON.
+
+### 1. Bring in the reducer
+
+Copy `core.rs` into your crate (or depend on it, if you split it into its own published crate) and rewrite the two functions where your actual data model lives — everything else in the module (version vectors, the op log, `ops_since`, `state_fingerprint`) keeps working unmodified, whatever `Op`'s payload turns out to hold:
+
+```rust
+pub fn apply(&mut self, op: Op) -> bool
+pub fn local_change(&mut self, entity: &str, kind: OpKind, value: &str) -> Op
+```
+
+Keep the two invariants from the section above — idempotent/commutative merge, deterministic tie-break — and you're done with this part.
+
+### 2. Expose the sync endpoints
+
+Two replicas reconcile by speaking four small endpoints. Add them to whatever HTTP server your app already runs — axum, actix-web, warp, a bare `TcpListener`, it doesn't matter — only the shapes matter:
+
+| Method | Path             | Body                        | Returns                                                      |
+|--------|------------------|------------------------------|----------------------------------------------------------------|
+| GET    | `/v1/vv`         | —                            | your `VersionVector`                                            |
+| POST   | `/v1/ops/since`  | `{ "vv": VersionVector }`     | `{ "ops": [Op, ...] }` — ops you have that the caller is missing |
+| POST   | `/v1/ops`        | `{ "ops": [Op, ...] }`        | `{ "applied": usize, "vv": VersionVector }`                     |
+| POST   | `/v1/peers`      | `{ "peers": [Peer, ...] }`    | the union of what you both know (PEX only — skip this one if you already have your own discovery) |
+
+### 3. Drive it with a periodic sync round
+
+`sync_round()` in `main.rs` is the whole algorithm, end to end: pull what the peer has that you don't (`/v1/ops/since`), push what you have that the peer doesn't (`/v1/ops`), then a symmetric peer exchange. It's about forty lines and touches nothing from `core`/`discovery` beyond the `Op`/`Peer` types — copy it as-is and point it at whichever HTTP client your app already uses.
+
+Spawn it on a timer (`tokio::spawn` plus `sleep` in this demo) against your list of known peer addresses. Where those addresses come from is entirely up to you:
+
+- keep `discovery.rs` if you're also running on a tailnet;
+- swap it for mDNS/DNS-SD on a LAN;
+- swap it for a static list from config, or a call into whatever service registry you already run (Kubernetes, Consul, anything).
+
+The reducer and the sync protocol neither know nor care — they only ever see a `Vec<String>` of `host:port` targets.
+
+### 4. Optional: a local-first "offline" toggle
+
+The pattern this rig's UI demonstrates — a device stays fully usable, reads and writes never block, while only its peer-to-peer surface is turned off — is just: gate the four sync endpoints above (and any discovery probe) behind a flag, and never gate your own read/write endpoints on it. See `guard_online` in `main.rs` for the roughly ten-line version.
+
+That's the entire surface. Nothing in `core.rs` or the wire protocol assumes axum, tailscale, or even Rust on both ends — a peer can be any language that speaks the same four JSON endpoints.
+
+## What this rig doesn't prove
+
+It doesn't test the iOS client, which needs to run against a real node (see the PoC's own README). It doesn't test encryption, which doesn't exist yet: `payload` is plaintext and ops aren't signed. And it doesn't test compaction, because in a test session the op log never grows long enough to become a problem.

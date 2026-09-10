@@ -15,10 +15,11 @@ x-node: &node
   environment: &node-env
     TS_AUTHKEY: "${TS_AUTHKEY:?an auth key is required, copy env.example to .env}"
     SYNCD_PORT: "47100"
+    TS_USERSPACE: "true"
   cap_add: [NET_ADMIN, NET_RAW]
   devices: ["/dev/net/tun:/dev/net/tun"]
   networks: [bench]
-  restart: unless-stopped
+  restart: on-failure:5
   healthcheck:
     test: ["CMD", "curl", "-fsS", "http://127.0.0.1:47100/v1/node"]
     interval: 5s
@@ -42,6 +43,8 @@ services:
       - --peer-prefix=syncd-          # only probe this rig's own nodes
       - --interval=3
       - --telemetry=http://logger:9000/ev
+      - --data=/data
+    volumes: ["data-a:/data"]
     ports: ["47101:47100"]
 
   device-b:
@@ -58,6 +61,8 @@ services:
       - --peer-prefix=syncd-
       - --interval=3
       - --telemetry=http://logger:9000/ev
+      - --data=/data
+    volumes: ["data-b:/data"]
     ports: ["47102:47100"]
 
   device-c:
@@ -74,6 +79,8 @@ services:
       - --peer-prefix=syncd-
       - --interval=3
       - --telemetry=http://logger:9000/ev
+      - --data=/data
+    volumes: ["data-c:/data"]
     ports: ["47103:47100"]
 
   # The observer. No TS_AUTHKEY: it doesn't join the tailnet and isn't a
@@ -96,3 +103,8 @@ services:
 networks:
   bench:
     driver: bridge
+
+volumes:
+  data-a:
+  data-b:
+  data-c:

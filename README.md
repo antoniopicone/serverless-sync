@@ -47,6 +47,16 @@ I ruled out the two alternatives for a specific reason. A fourth peer that quiet
 
 Phase 5 of the scenario turns the logger off, writes to a node, and checks that the three still converge. An observer that becomes a dependency is a bug in the observer.
 
+## Persistence
+
+Every node keeps its state in a CSV file (`--data`, default `./data/<device>.csv`, `/data` in the Docker rig — one Docker volume per node so it survives a container restart).
+
+The file isn't a snapshot of "current values" — it's a **log of operations**: one row per change, in the order it happened (`device,seq,entity,kind,value,hlc`), appended as it's accepted, never rewritten. What you actually read and write against at runtime is a `BTreeMap` kept in memory (`entries` in `src/core.rs`) — that's the fast part, O(log n) per lookup/insert. The CSV only exists so that map isn't lost when the process restarts: on startup, every row is replayed in order through the same `apply()` used for sync, which rebuilds the in-memory map from scratch.
+
+So: disk = history (durable, human-readable, append-only), memory = current state (fast, disposable, rebuilt from disk on boot). This also means an op received from a peer is persisted exactly like a local one — durability doesn't depend on which device typed the value first.
+
+One thing this doesn't do: compaction. The log only ever grows, so a very long-lived node would eventually pay an O(n) replay on every restart. It's not implemented here for a reason worth knowing — you can't just keep the latest row per entity and drop the rest, because a peer that's far behind still needs `/v1/ops/since` to answer with the *ops* it's missing, not just final values, and dropping history can leave gaps a stale peer can never fill in. Doing it correctly needs a snapshot format on top of the log, not just a shorter log.
+
 ## Where your application plugs in
 
 The service running in the containers is a fake key/value store. The insertion point is `src/core.rs`, and only that:

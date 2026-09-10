@@ -9,6 +9,7 @@
 
 mod core;
 mod discovery;
+mod persist;
 mod telemetry;
 
 use axum::{extract::State, http::StatusCode, routing::{get, post}, Json, Router};
@@ -25,6 +26,10 @@ const SERVICE: &str = "pass";
 #[derive(Clone)]
 struct App {
     replica: Arc<Mutex<Replica>>,
+    /// Durable mirror of every op accepted into `replica`, local or
+    /// remote. See persist.rs: the CSV is the log, `replica` is the
+    /// in-memory view rebuilt from it at startup.
+    data: Arc<persist::OpLog>,
     pex: PexCache,
     hostname: String,
     port: u16,
@@ -108,8 +113,23 @@ async fn ops_push(State(a): State<App>, Json(req): Json<PushReq>) -> Result<Json
     let mut ops = req.ops;
     // sort by (device, seq): apply rejects causal gaps
     ops.sort_by_key(|o| (o.device.clone(), o.seq));
-    let applied = ops.into_iter().filter(|o| r.apply(o.clone())).count();
+    let applied = ops.into_iter().filter(|o| {
+        let ok = r.apply(o.clone());
+        if ok {
+            persist_or_log(&a, &o);
+        }
+        ok
+    }).count();
     Ok(Json(PushResp { applied, vv: r.version_vector() }))
+}
+
+/// Best-effort durability, same posture as telemetry: an op that's already
+/// merged into `replica` must not be lost if the write to disk fails, so
+/// this logs and moves on rather than turning a sync round into a 500.
+fn persist_or_log(a: &App, op: &Op) {
+    if let Err(e) = a.data.append(op) {
+        eprintln!("[persist] failed to append op ({} seq {}): {e}", op.device, op.seq);
+    }
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -155,6 +175,7 @@ async fn write(State(a): State<App>, Json(req): Json<WriteReq>) -> Json<serde_js
         Some(v) => r.local_change(&req.entity, OpKind::Upsert, &v),
         None => r.local_change(&req.entity, OpKind::Delete, ""),
     };
+    persist_or_log(&a, &op);
     a.tel.emit("op.local", serde_json::json!({
         "entity": op.entity, "seq": op.seq, "kind": format!("{:?}", op.kind),
     }));
@@ -212,7 +233,13 @@ async fn sync_round(app: &App, addr: &str) -> Result<(usize, usize), String> {
         let mut r = app.replica.lock().unwrap();
         let mut ops = pulled.ops;
         ops.sort_by_key(|o| (o.device.clone(), o.seq));
-        ops.into_iter().filter(|o| r.apply(o.clone())).count()
+        ops.into_iter().filter(|o| {
+            let ok = r.apply(o.clone());
+            if ok {
+                persist_or_log(app, o);
+            }
+            ok
+        }).count()
     };
 
     // 2. push: what I have that they don't
@@ -342,8 +369,30 @@ async fn main() {
     let tel = telemetry::Telemetry::new(arg("--telemetry"), device.clone());
     let peer_prefix = arg("--peer-prefix").unwrap_or_default();
 
+    // Persistence: replay whatever this device already had on disk, then
+    // keep appending to the same file. A fresh device with no file yet
+    // just starts empty.
+    let data_dir = arg("--data").unwrap_or_else(|| "./data".into());
+    let data_path = persist::default_path(&data_dir, &device);
+    let mut replica = Replica::new(device.clone(), SERVICE.into());
+    let loaded_ops = persist::load(&data_path).unwrap_or_else(|e| {
+        eprintln!("[persist] failed to read {}: {e} (starting empty)", data_path.display());
+        Vec::new()
+    });
+    let n_loaded = loaded_ops.len();
+    for op in loaded_ops {
+        replica.apply(op);
+    }
+    let data = persist::OpLog::open(&data_path).unwrap_or_else(|e| {
+        panic!("[persist] cannot open {} for writing: {e}", data_path.display())
+    });
+    if n_loaded > 0 {
+        println!("[persist] replayed {n_loaded} ops from {}", data_path.display());
+    }
+
     let app = App {
-        replica: Arc::new(Mutex::new(Replica::new(device.clone(), SERVICE.into()))),
+        replica: Arc::new(Mutex::new(replica)),
+        data: Arc::new(data),
         pex: PexCache::default(),
         hostname,
         port,

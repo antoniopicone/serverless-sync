@@ -6,6 +6,12 @@
 //! Usage:
 //!   syncd --device linux-1 --port 47100
 //!   syncd --device linux-2 --port 47101 --bootstrap 127.0.0.1:47100
+//!   syncd --device linux-3 --port 47100 --no-lan-discovery
+//!
+//! The HTTP API always listens on 0.0.0.0, so it's reachable from both the
+//! LAN and a tailnet interface. Peers are found via tailscale (if present),
+//! a LAN broadcast announce/listen (unless --no-lan-discovery), and peer
+//! exchange — see discovery.rs.
 
 mod core;
 mod discovery;
@@ -360,14 +366,18 @@ async fn main() {
         .unwrap_or_else(|| device.clone());
 
     // --advertise 100.x.y.z:47100  (tailnet IP). Default: first tailnet IP
-    // found, otherwise loopback for local testing.
+    // found, else this machine's own LAN IP, else loopback for local
+    // testing (nothing routable was found at all).
+    let lan_ip = discovery::local_lan_ip();
     let advertise = arg("--advertise")
         .or_else(|| std::env::var("SYNCD_ADVERTISE").ok())
         .or_else(|| discovery::my_tailnet_ip().map(|ip| format!("{ip}:{port}")))
+        .or_else(|| lan_ip.clone().map(|ip| format!("{ip}:{port}")))
         .unwrap_or_else(|| format!("127.0.0.1:{port}"));
 
     let tel = telemetry::Telemetry::new(arg("--telemetry"), device.clone());
     let peer_prefix = arg("--peer-prefix").unwrap_or_default();
+    let lan_discovery_enabled = !args.iter().any(|a| a == "--no-lan-discovery");
 
     // Persistence: replay whatever this device already had on disk, then
     // keep appending to the same file. A fresh device with no file yet
@@ -420,8 +430,32 @@ async fn main() {
     let interval: u64 = arg("--interval").and_then(|i| i.parse().ok()).unwrap_or(5);
     tokio::spawn(antientropy_loop(app.clone(), bootstrap, interval));
 
+    if lan_discovery_enabled {
+        match &lan_ip {
+            Some(ip) => {
+                let me = Peer {
+                    hostname: app.hostname.clone(),
+                    addr: format!("{ip}:{port}"),
+                    device_id: device.clone(),
+                };
+                tokio::spawn(discovery::lan_discovery_loop(
+                    me,
+                    app.peer_prefix.clone(),
+                    app.pex.clone(),
+                    std::time::Duration::from_secs(interval),
+                ));
+            }
+            None => eprintln!("[lan-discovery] disabled: couldn't determine a local network address"),
+        }
+    }
+
     // 0.0.0.0 because the tailscale0 interface has its own dedicated 100.x IP
+    // (and, same reasoning, any LAN interface's own address)
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
-    println!("syncd device={device} service={SERVICE} port={port} advertise={advertise}");
+    println!(
+        "syncd device={device} service={SERVICE} port={port} advertise={advertise} lan_ip={} lan_discovery={}",
+        lan_ip.as_deref().unwrap_or("none"),
+        lan_discovery_enabled,
+    );
     axum::serve(listener, router).await.unwrap();
 }

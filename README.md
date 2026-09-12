@@ -1,5 +1,26 @@
 # Docker Compose Test Rig
 
+## Installing syncd
+
+Prebuilt binaries are published on [GitHub Releases](https://github.com/antoniopicone/serverless-sync/releases) for macOS (arm64), Linux (x86_64 and arm64), and Windows (x86_64) — no Rust toolchain needed. Each tagged push (`v*.*.*`) triggers [.github/workflows/release.yml](.github/workflows/release.yml), which builds every target and attaches a checksummed archive per platform.
+
+**macOS / Linux** — downloads the right binary, installs it, and registers it as a service (systemd on Linux, launchd on macOS):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/install.sh | bash -s -- --device my-device --port 47100
+```
+
+**Windows** (PowerShell) — installs the binary and registers a Scheduled Task that starts it at boot/logon and restarts it on failure:
+
+```powershell
+iwr https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/install.ps1 -OutFile install.ps1
+./install.ps1 -Device my-device -Port 47100
+```
+
+Pass `--no-service` / `-NoService` to install just the binary without touching systemd/launchd/Task Scheduler. See `install/install.sh --help` for every flag, and `install/uninstall.sh` / `install/uninstall.ps1` to remove the service and binary again.
+
+## The test rig
+
 Three devices on your real tailnet plus one observer. No addresses configured: nodes find each other by querying `tailscaled`.
 
 ```
@@ -12,6 +33,7 @@ scenario.sh             test sequence with automatic assertions
 ## Start
 
 ```bash
+sudo apt-get install -y libssl-dev
 cp env.example .env       # put your auth key in here
 docker compose up -d --build
 open http://localhost:9000
@@ -37,7 +59,11 @@ Green requires **every** node to respond and agree. The nuance matters: if a nod
 
 **`--accept-dns=false` is mandatory.** Without it, `tailscaled` rewrites `/etc/resolv.conf` toward MagicDNS and the container stops resolving Docker-network names: nodes would no longer find `logger`. Discovery doesn't need it anyway, since it reads the `100.x` addresses straight out of `tailscale status --json`.
 
-**`--peer-prefix=syncd-`.** Without a filter, every node would probe *every* device on your tailnet — laptop, phone, Raspberry Pi — on every round. The hostname filter is a test-rig shortcut: in production the real filter is the roster of authorized devices, not the name.
+**`--peer-prefix=syncd-`.** Without a filter, every node would probe *every* device on your tailnet — laptop, phone, Raspberry Pi — on every round. The hostname filter is a test-rig shortcut: in production the real filter is the roster of authorized devices, not the name. The same filter applies to the LAN broadcast discovery below, for the same reason.
+
+## Discovery beyond the tailnet
+
+A node doesn't need tailscale to be found: alongside `tailscale status --json`, every node also broadcasts a UDP announce on its local subnet and listens for the same from others (`discovery::lan_discovery_loop`, port 47188), merging whatever it hears into the same peer-exchange cache the tailnet path and PEX write into — so a LAN-only device shows up in the sync targets with no extra plumbing. `--advertise` (the address a node hands out to peers) now falls back from an explicit flag, to the tailnet IP, to the machine's own LAN IP, and only to `127.0.0.1` if none of those resolve — so a peer without tailscale gets an address it can actually reach. Pass `--no-lan-discovery` to turn the broadcast off (e.g. on a network that filters it, or if you only want the tailnet-gated behavior above).
 
 ## The logger is not in the sync path
 
@@ -80,7 +106,7 @@ If you change `core.rs`, change the equivalent client-side reducer in parallel. 
 This rig is really three independent pieces wired together in `main.rs`. Each one stands on its own:
 
 - **`src/core.rs`** — the CRDT reducer: `Replica`, `Op`, `OpKind`, `VersionVector`, HLC-based deterministic conflict resolution. Self-contained; it has no dependency on HTTP, tailscale, or the key/value shape this demo happens to use.
-- **`src/discovery.rs`** — peer discovery over a tailnet via `tailscale status --json`, plus a bidirectional peer-exchange (PEX) cache. Entirely optional — swap it for whatever already tells your app where its peers are.
+- **`src/discovery.rs`** — peer discovery over a tailnet via `tailscale status --json`, a UDP broadcast announce/listen for plain-LAN peers, plus a bidirectional peer-exchange (PEX) cache. Entirely optional — swap it for whatever already tells your app where its peers are.
 - **The wire protocol** — a handful of HTTP endpoints two replicas use to reconcile state. Framework-agnostic: this demo happens to use axum, but the shapes below are plain JSON.
 
 ### 1. Bring in the reducer
@@ -111,8 +137,8 @@ Two replicas reconcile by speaking four small endpoints. Add them to whatever HT
 
 Spawn it on a timer (`tokio::spawn` plus `sleep` in this demo) against your list of known peer addresses. Where those addresses come from is entirely up to you:
 
-- keep `discovery.rs` if you're also running on a tailnet;
-- swap it for mDNS/DNS-SD on a LAN;
+- keep `discovery.rs` as-is if a tailnet and/or a plain LAN (via its UDP broadcast) already covers where your peers are;
+- swap it for mDNS/DNS-SD if you need LAN discovery across subnets broadcast can't reach;
 - swap it for a static list from config, or a call into whatever service registry you already run (Kubernetes, Consul, anything).
 
 The reducer and the sync protocol neither know nor care — they only ever see a `Vec<String>` of `host:port` targets.

@@ -32,12 +32,25 @@ pub struct Peer {
     pub device_id: String,
 }
 
+/// One registered application, as reported by `/v1/node`.
+#[derive(Serialize)]
+pub struct ServiceInfo {
+    pub name: String,
+    pub token: String,
+    pub entries: usize,
+}
+
+/// A single syncd process now hosts every application registered on this
+/// machine behind one port (see `main.rs`'s registry) — `services` lists
+/// whichever ones have been registered (or resumed from disk) so far,
+/// instead of the one hardcoded "service" a node used to expose.
 #[derive(Serialize)]
 pub struct NodeInfo {
     pub proto: u32,
     pub device_id: String,
     pub hostname: String,
-    pub services: BTreeMap<String, u16>,
+    pub port: u16,
+    pub services: Vec<ServiceInfo>,
 }
 
 /// Shared directory of known peers, learned via peer exchange. No

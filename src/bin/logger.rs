@@ -2,7 +2,11 @@
 //!
 //! NOT a peer and NOT in the sync path. It does two things:
 //!   1. receives events pushed from the nodes (POST /ev) for the timeline;
-//!   2. polls each node's /v1/state for the authoritative fingerprint.
+//!   2. polls each node's /v1/{name}/{token}/state for the authoritative
+//!      fingerprint, where {name}/{token} is this rig's own demo
+//!      application (SERVICE_NAME/SERVICE_TOKEN, default "demo"/"v1") —
+//!      see "Registering an application" in README.md for what those mean
+//!      to a real client.
 //!
 //! The fingerprint is the signal: the same across all nodes means replicas
 //! are aligned, different means the merge has diverged. GET /api/assert
@@ -67,6 +71,11 @@ struct Inner {
 struct Log {
     inner: Arc<Mutex<Inner>>,
     targets: Vec<String>,
+    /// "{name}/{token}" of this rig's own demo application — every
+    /// per-application syncd endpoint is namespaced under this, so the
+    /// logger (and scenario.sh) talk to one fixed (name, token) pair
+    /// instead of the flat /v1/* routes older versions of this rig used.
+    service_path: String,
 }
 
 fn now() -> u64 {
@@ -161,7 +170,7 @@ async fn api_assert(State(l): State<Log>) -> impl IntoResponse {
     (code, Json(json!({ "converged": ok, "live_aligned": live_aligned, "detail": detail })))
 }
 
-/// Polls /v1/state on every node. The logger is the only thing that talks
+/// Polls the demo app's state on every node. The logger is the only thing that talks
 /// to all of them: the nodes don't know it exists, beyond blindly getting
 /// events pushed at them.
 async fn poller(l: Log) {
@@ -174,7 +183,7 @@ async fn poller(l: Log) {
             // all the network work BEFORE taking the lock: holding a
             // MutexGuard across an await would block the whole logger
             let fetched: Option<serde_json::Value> = match http
-                .get(format!("http://{t}/v1/state"))
+                .get(format!("http://{t}/v1/{}/state", l.service_path))
                 .send()
                 .await
             {
@@ -243,7 +252,8 @@ async fn device_write(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    proxy_post(&l, &id, "/v1/write", body).await
+    let path = format!("/v1/{}/write", l.service_path);
+    proxy_post(&l, &id, &path, body).await
 }
 
 async fn device_online(
@@ -263,8 +273,11 @@ async fn main() {
         .filter(|s| !s.is_empty())
         .collect();
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(9000);
+    let service_name = std::env::var("SERVICE_NAME").unwrap_or_else(|_| "demo".into());
+    let service_token = std::env::var("SERVICE_TOKEN").unwrap_or_else(|_| "v1".into());
+    let service_path = format!("{service_name}/{service_token}");
 
-    let log = Log { inner: Arc::new(Mutex::new(Inner::default())), targets: targets.clone() };
+    let log = Log { inner: Arc::new(Mutex::new(Inner::default())), targets: targets.clone(), service_path: service_path.clone() };
     tokio::spawn(poller(log.clone()));
 
     let app = Router::new()
@@ -276,7 +289,7 @@ async fn main() {
         .route("/api/devices/:id/online", post(device_online))
         .with_state(log);
 
-    println!("logger on :{port}, watching {}", targets.join(" "));
+    println!("logger on :{port}, watching {} for {service_path}", targets.join(" "));
     let l = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
     axum::serve(l, app).await.unwrap();
 }

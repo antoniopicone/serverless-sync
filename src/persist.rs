@@ -98,7 +98,7 @@ impl OpLog {
 
     /// Appends one op and flushes: a write isn't durable to the caller
     /// until it's actually on disk, otherwise a crash right after
-    /// responding 200 to `/v1/write` could still lose the op.
+    /// responding 200 to a write could still lose the op.
     pub fn append(&self, op: &Op) -> io::Result<()> {
         let record = to_record(op);
         let mut file = self.file.lock().unwrap();
@@ -110,6 +110,30 @@ impl OpLog {
     }
 }
 
-pub fn default_path(data_dir: &str, device: &str) -> PathBuf {
-    Path::new(data_dir).join(format!("{device}.csv"))
+/// Where one registered application's log lives on disk: one file per
+/// (name, token) pair under the shared data root, so independent
+/// applications — and independent versions of the same one, once the
+/// token changes — never share a file.
+pub fn service_path(data_root: &Path, name: &str, token: &str) -> PathBuf {
+    data_root.join(format!("{name}.{token}.csv"))
+}
+
+/// Every (name, token) pair that already has a log on disk, discovered by
+/// listing the data root — used at startup to resume syncing applications
+/// that registered before the last restart without waiting for them to
+/// make a fresh request first. `name`/`token` are reconstructed by
+/// splitting the filename on its first `.`, which is unambiguous because
+/// both are restricted to `[A-Za-z0-9_-]` (see `main.rs::valid_key_part`)
+/// and so never contain a `.` themselves.
+pub fn known_services(data_root: &Path) -> Vec<(String, String)> {
+    let Ok(read_dir) = fs::read_dir(data_root) else { return Vec::new() };
+    read_dir
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let file_name = entry.file_name();
+            let stem = file_name.to_str()?.strip_suffix(".csv")?;
+            let (name, token) = stem.split_once('.')?;
+            Some((name.to_string(), token.to_string()))
+        })
+        .collect()
 }

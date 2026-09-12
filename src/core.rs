@@ -48,9 +48,12 @@ struct Entry {
     device: String,
 }
 
+/// One independent CRDT dataset. `main.rs` keeps one `Replica` per
+/// registered application (name+token) — see the registry in `main.rs` —
+/// so this type itself doesn't need to know which application it belongs
+/// to; that's purely a lookup key one layer up.
 pub struct Replica {
     pub device: String,
-    pub service: String,
     seq: u64,
     hlc_time: u64,
     hlc_counter: u32,
@@ -67,10 +70,9 @@ fn now_millis() -> u64 {
 }
 
 impl Replica {
-    pub fn new(device: String, service: String) -> Self {
+    pub fn new(device: String) -> Self {
         Self {
             device,
-            service,
             seq: 0,
             hlc_time: 0,
             hlc_counter: 0,

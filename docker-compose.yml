@@ -96,6 +96,11 @@ services:
     environment:
       DEVICES: "device-a:47100,device-b:47100,device-c:47100"
       PORT: "9000"
+      # Which registered application this rig demonstrates (see
+      # "Registering an application" in README.md) — the nodes don't need
+      # to know this themselves, they create it lazily on first contact.
+      SERVICE_NAME: "demo"
+      SERVICE_TOKEN: "v1"
     ports: ["9000:9000"]
     networks: [bench]
     restart: unless-stopped

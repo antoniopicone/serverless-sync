@@ -11,8 +11,14 @@ C=http://localhost:47103
 LOG=http://localhost:9000
 FAILED=0
 
-write() { curl -sS -XPOST "$1/v1/write" -H 'content-type: application/json' \
+# This rig's own demo application (see docker-compose.yml's
+# SERVICE_NAME/SERVICE_TOKEN, and "Registering an application" in
+# README.md) — every per-application syncd endpoint is namespaced under it.
+SVC=demo/v1
+
+write() { curl -sS -XPOST "$1/v1/$SVC/write" -H 'content-type: application/json' \
                -d "{\"entity\":\"$2\",\"value\":\"$3\"}" >/dev/null; }
+state() { curl -sS "$1/v1/$SVC/state"; }
 
 detail() { curl -sS "$LOG/api/assert" | python3 -c 'import sys,json;print(json.load(sys.stdin)["detail"])'; }
 
@@ -64,7 +70,7 @@ echo; echo "== 4. recovery =="
 docker compose unpause device-c >/dev/null
 assert converged "converges with no intervention" 45
 echo "  winner on github:"
-curl -sS "$A/v1/state" | python3 -c '
+state "$A" | python3 -c '
 import sys,json;d=json.load(sys.stdin)
 print("   ", [e for e in d["entries"] if e["entity"]=="github"][0]["value"])'
 
@@ -72,10 +78,10 @@ echo; echo "== 5. the logger is not a dependency =="
 docker compose stop logger >/dev/null
 write "$B" without-logger ok
 sleep 10
-FP=$(curl -sS "$A/v1/state" | python3 -c 'import sys,json;print(json.load(sys.stdin)["fingerprint"])')
+FP=$(state "$A" | python3 -c 'import sys,json;print(json.load(sys.stdin)["fingerprint"])')
 SAME=1
 for u in "$B" "$C"; do
-  f=$(curl -sS "$u/v1/state" | python3 -c 'import sys,json;print(json.load(sys.stdin)["fingerprint"])')
+  f=$(state "$u" | python3 -c 'import sys,json;print(json.load(sys.stdin)["fingerprint"])')
   [ "$f" = "$FP" ] || SAME=0
 done
 docker compose start logger >/dev/null

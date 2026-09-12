@@ -2,15 +2,29 @@
 
 ## Installing syncd
 
-Prebuilt binaries are published on [GitHub Releases](https://github.com/antoniopicone/serverless-sync/releases) for macOS (arm64), Linux (x86_64 and arm64), and Windows (x86_64) — no Rust toolchain needed. Each tagged push (`v*.*.*`) triggers [.github/workflows/release.yml](.github/workflows/release.yml), which builds every target and attaches a checksummed archive per platform.
+Prebuilt binaries are published on [GitHub Releases](https://github.com/antoniopicone/serverless-sync/releases) for macOS (arm64), Linux (x86_64 and arm64), and Windows (x86_64) — no Rust toolchain needed. Every tag push triggers [.github/workflows/release.yml](.github/workflows/release.yml), which builds every target and attaches a checksummed archive per platform to that tag's release.
 
-**macOS / Linux** — downloads the right binary, installs it, and registers it as a service (systemd on Linux, launchd on macOS):
+**macOS / Linux** — detects your OS and CPU, downloads the matching build, installs it, and registers it as a service (systemd on Linux, launchd on macOS):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/install.sh | bash -s -- --device my-device --port 47100
+curl -fsSL https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/install.sh | sh
 ```
 
-**Windows** (PowerShell) — installs the binary and registers a Scheduled Task that starts it at boot/logon and restarts it on failure:
+**Windows** (PowerShell) — same, registering a Scheduled Task that starts it at boot/logon and restarts it on failure:
+
+```powershell
+irm https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/install.ps1 | iex
+```
+
+Both are safe to re-run — an existing syncd service is stopped and replaced, not duplicated — so the same command doubles as the upgrade path.
+
+To pass options (`--device`, `--port`, `--bootstrap`, ...) rather than take the defaults, add them after `--`:
+
+```bash
+curl -fsSL .../install.sh | sh -s -- --device my-device --port 47100
+```
+
+PowerShell's piped `iex` can't take parameters, so download it first if you need them:
 
 ```powershell
 iwr https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/install.ps1 -OutFile install.ps1

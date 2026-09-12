@@ -1,13 +1,13 @@
-#!/usr/bin/env bash
+#!/bin/sh
 #
 # Reverses install.sh: stops and removes the syncd service (systemd or
 # launchd) and deletes the installed binary.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/uninstall.sh | bash
-#   curl -fsSL .../uninstall.sh | bash -s -- --prefix /usr/local/bin
+#   curl -fsSL https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/uninstall.sh | sh
+#   curl -fsSL .../uninstall.sh | sh -s -- --prefix /usr/local/bin
 
-set -euo pipefail
+set -eu
 
 PREFIX=""
 while [ $# -gt 0 ]; do

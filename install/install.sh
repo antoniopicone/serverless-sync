@@ -1,13 +1,16 @@
-#!/usr/bin/env bash
+#!/bin/sh
 #
 # Installs the latest (or a pinned) syncd release for macOS/Linux and
 # registers it as a background service (systemd on Linux, launchd on
 # macOS) unless --no-service is passed. Safe to re-run: an existing
 # syncd service (system or per-user) is stopped first, then replaced.
 #
+# POSIX sh only (no bash-isms: no arrays, no `set -o pipefail`) so it
+# also works when piped straight into `sh`, not just `bash`.
+#
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/install.sh | bash
-#   curl -fsSL .../install.sh | bash -s -- --device laptop-1 --port 47100 --bootstrap 100.64.0.1:47100
+#   curl -fsSL https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/install.sh | sh
+#   curl -fsSL .../install.sh | sh -s -- --device laptop-1 --port 47100 --bootstrap 100.64.0.1:47100
 #
 # Options:
 #   --version vX.Y.Z     install a specific release instead of latest
@@ -22,7 +25,7 @@
 #   --no-service         install the binary only, skip service registration
 #   --prefix DIR         install directory (default: /usr/local/bin or ~/.local/bin)
 
-set -euo pipefail
+set -eu
 
 REPO="antoniopicone/serverless-sync"
 VERSION="latest"
@@ -33,6 +36,11 @@ PREFIX=""
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m==>\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# POSIX has no `printf %q`; single-quote the argument the portable way,
+# turning any embedded quote into '\'' so it survives re-parsing by a
+# shell (used to build the systemd ExecStart= line).
+shquote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 # Idempotency: stop whatever this script previously installed — in either
 # scope (system or per-user), since a re-run as a different user than last
@@ -171,27 +179,29 @@ if [ "$NO_SERVICE" = "1" ]; then
   exit 0
 fi
 
-# Build the syncd argument list from whichever options were provided;
+# Build the syncd argument list from whichever options were provided, as
+# positional parameters (POSIX sh has no arrays) — the option-parsing
+# loop above has already consumed the original "$@", so it's free to reuse.
 # syncd falls back to its own defaults (device=linux-1, port=47100, ...)
 # for anything left unset.
-args=()
-[ -n "$DEVICE" ]      && args+=(--device "$DEVICE")
-[ -n "$PORT" ]        && args+=(--port "$PORT")
-[ -n "$BOOTSTRAP" ]   && args+=(--bootstrap "$BOOTSTRAP")
-[ -n "$DATA" ]        && args+=(--data "$DATA")
-[ -n "$PEER_PREFIX" ] && args+=(--peer-prefix "$PEER_PREFIX")
-[ -n "$ADVERTISE" ]   && args+=(--advertise "$ADVERTISE")
-[ -n "$TELEMETRY" ]   && args+=(--telemetry "$TELEMETRY")
-[ -n "$INTERVAL" ]    && args+=(--interval "$INTERVAL")
+set --
+[ -n "$DEVICE" ]      && set -- "$@" --device "$DEVICE"
+[ -n "$PORT" ]        && set -- "$@" --port "$PORT"
+[ -n "$BOOTSTRAP" ]   && set -- "$@" --bootstrap "$BOOTSTRAP"
+[ -n "$DATA" ]        && set -- "$@" --data "$DATA"
+[ -n "$PEER_PREFIX" ] && set -- "$@" --peer-prefix "$PEER_PREFIX"
+[ -n "$ADVERTISE" ]   && set -- "$@" --advertise "$ADVERTISE"
+[ -n "$TELEMETRY" ]   && set -- "$@" --telemetry "$TELEMETRY"
+[ -n "$INTERVAL" ]    && set -- "$@" --interval "$INTERVAL"
 
 if [ "$platform" = "linux" ]; then
   if ! command -v systemctl >/dev/null 2>&1; then
-    warn "systemd not found; skipping service registration. Run manually: ${dest} ${args[*]}"
+    warn "systemd not found; skipping service registration. Run manually: ${dest} $*"
     exit 0
   fi
 
   exec_line="${dest}"
-  for a in "${args[@]+"${args[@]}"}"; do exec_line+=" $(printf '%q' "$a")"; done
+  for a in "$@"; do exec_line="$exec_line $(shquote "$a")"; done
 
   if [ "$as_root" = "1" ]; then
     wanted_by="multi-user.target"
@@ -232,13 +242,13 @@ WantedBy=${wanted_by}
 
 elif [ "$platform" = "macos" ]; then
   if ! command -v launchctl >/dev/null 2>&1; then
-    warn "launchctl not found; skipping service registration. Run manually: ${dest} ${args[*]}"
+    warn "launchctl not found; skipping service registration. Run manually: ${dest} $*"
     exit 0
   fi
 
   args_xml=""
-  for a in "${args[@]+"${args[@]}"}"; do
-    args_xml+="        <string>${a}</string>
+  for a in "$@"; do
+    args_xml="$args_xml        <string>${a}</string>
 "
   done
 

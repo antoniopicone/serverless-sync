@@ -2,7 +2,8 @@
 #
 # Installs the latest (or a pinned) syncd release for macOS/Linux and
 # registers it as a background service (systemd on Linux, launchd on
-# macOS) unless --no-service is passed.
+# macOS) unless --no-service is passed. Safe to re-run: an existing
+# syncd service (system or per-user) is stopped first, then replaced.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/install.sh | bash
@@ -32,6 +33,35 @@ PREFIX=""
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m==>\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Idempotency: stop whatever this script previously installed — in either
+# scope (system or per-user), since a re-run as a different user than last
+# time would otherwise leave two services running two copies of syncd —
+# so the binary underneath isn't in use when we overwrite it below, and so
+# the service that gets (re)created after actually picks up the new build
+# instead of continuing to run the old one it started with.
+stop_existing_service() {
+  local label="com.syncd.agent"
+  if [ "$platform" = "linux" ] && command -v systemctl >/dev/null 2>&1; then
+    if [ -f /etc/systemd/system/syncd.service ]; then
+      log "Stopping previous system service"
+      sudo systemctl disable --now syncd >/dev/null 2>&1 || true
+    fi
+    if [ -f "${HOME}/.config/systemd/user/syncd.service" ]; then
+      log "Stopping previous user service"
+      systemctl --user disable --now syncd >/dev/null 2>&1 || true
+    fi
+  elif [ "$platform" = "macos" ] && command -v launchctl >/dev/null 2>&1; then
+    if [ -f "/Library/LaunchDaemons/${label}.plist" ]; then
+      log "Stopping previous LaunchDaemon"
+      sudo launchctl bootout system "/Library/LaunchDaemons/${label}.plist" >/dev/null 2>&1 || true
+    fi
+    if [ -f "${HOME}/Library/LaunchAgents/${label}.plist" ]; then
+      log "Stopping previous LaunchAgent"
+      launchctl bootout "gui/$(id -u)" "${HOME}/Library/LaunchAgents/${label}.plist" >/dev/null 2>&1 || true
+    fi
+  fi
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -102,6 +132,8 @@ log "Extracting"
 tar xzf "${workdir}/${asset}" -C "$workdir"
 binary="${workdir}/syncd-${target}/syncd"
 [ -x "$binary" ] || chmod +x "$binary"
+
+stop_existing_service
 
 # Pick an install directory: prefer /usr/local/bin when we can write there
 # (root, or sudo group on macOS), otherwise fall back to a per-user path.

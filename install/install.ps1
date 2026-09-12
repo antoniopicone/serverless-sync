@@ -2,7 +2,8 @@
 .SYNOPSIS
   Installs the latest (or a pinned) syncd release for Windows and registers
   it as a background service via Task Scheduler (runs at startup, restarts
-  on failure) unless -NoService is passed.
+  on failure) unless -NoService is passed. Safe to re-run: an existing
+  syncd task and process are stopped first, then replaced.
 
 .EXAMPLE
   irm https://raw.githubusercontent.com/antoniopicone/serverless-sync/main/install/install.ps1 | iex
@@ -29,6 +30,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Repo = "antoniopicone/serverless-sync"
 $Target = "x86_64-pc-windows-msvc"
+$taskName = "syncd"
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Warn($msg) { Write-Host "==> $msg" -ForegroundColor Yellow }
@@ -68,6 +70,31 @@ try {
     Expand-Archive -Path $zipPath -DestinationPath $work -Force
     $binary = Join-Path $work "syncd-$Target\syncd.exe"
 
+    # Idempotency: stop and remove whatever this script previously
+    # installed before touching the binary or re-registering the task —
+    # otherwise Copy-Item fails on a locked, still-running syncd.exe, and
+    # a task left running would keep serving the old build even after a
+    # newer one lands on disk.
+    Write-Step "Stopping any previous syncd install"
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        try {
+            Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Stop
+        } catch {
+            Write-Warn "Could not remove the existing 'syncd' task ($($_.Exception.Message)) - if it was registered by an elevated install, re-run this script as Administrator."
+        }
+    }
+    $searchDirs = @("$env:ProgramFiles\syncd", "$env:LOCALAPPDATA\syncd")
+    if ($InstallDir) { $searchDirs += $InstallDir }
+    foreach ($dir in $searchDirs) {
+        $existingExe = Join-Path $dir "syncd.exe"
+        if (Test-Path $existingExe) {
+            Get-Process -Name "syncd" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -eq $existingExe } |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     if (-not $InstallDir) {
         $InstallDir = if ($isAdmin) { "$env:ProgramFiles\syncd" } else { "$env:LOCALAPPDATA\syncd" }
     }
@@ -96,9 +123,6 @@ try {
     if ($Advertise)  { $syncdArgs += @("--advertise", $Advertise) }
     if ($Telemetry)  { $syncdArgs += @("--telemetry", $Telemetry) }
     if ($Interval)   { $syncdArgs += @("--interval", $Interval) }
-
-    $taskName = "syncd"
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
     $argString = ($syncdArgs | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join " "
     $action = New-ScheduledTaskAction -Execute $dest -Argument $argString -WorkingDirectory $InstallDir

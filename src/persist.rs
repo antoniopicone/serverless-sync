@@ -118,6 +118,40 @@ pub fn service_path(data_root: &Path, name: &str, token: &str) -> PathBuf {
     data_root.join(format!("{name}.{token}.csv"))
 }
 
+/// Where one application's derived key (see `crypto::derive_key`) is
+/// cached on disk, so a device doesn't need its secret re-supplied by a
+/// local client on every restart — only the first time.
+pub fn key_path(data_root: &Path, name: &str, token: &str) -> PathBuf {
+    data_root.join(format!("{name}.{token}.key"))
+}
+
+/// Persists a derived key, restricted to the owning user where the
+/// platform supports it (Unix mode 0600) — this file is as sensitive as a
+/// password, since anyone who reads it can decrypt and forge that
+/// application's traffic.
+pub fn save_key(path: &Path, key: &crate::crypto::Key) -> io::Result<()> {
+    fs::write(path, key)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Loads a previously saved key, if the file exists and has the right
+/// length; `Ok(None)` (not an error) if there's simply nothing there yet.
+pub fn load_key(path: &Path) -> io::Result<Option<crate::crypto::Key>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    let key: crate::crypto::Key = bytes
+        .try_into()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "key file has the wrong length"))?;
+    Ok(Some(key))
+}
+
 /// Every (name, token) pair that already has a log on disk, discovered by
 /// listing the data root — used at startup to resume syncing applications
 /// that registered before the last restart without waiting for them to

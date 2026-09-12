@@ -24,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use syncd::crypto;
 
 const MAX_EVENTS: usize = 400;
 
@@ -76,6 +77,11 @@ struct Log {
     /// logger (and scenario.sh) talk to one fixed (name, token) pair
     /// instead of the flat /v1/* routes older versions of this rig used.
     service_path: String,
+    /// Derived from SERVICE_SECRET: every per-application request/response
+    /// is an encrypted+authenticated envelope (see crypto.rs), so the
+    /// logger needs this to read a node's state or forward a write, the
+    /// same as any other client of the demo application would.
+    key: crypto::Key,
 }
 
 fn now() -> u64 {
@@ -170,24 +176,69 @@ async fn api_assert(State(l): State<Log>) -> impl IntoResponse {
     (code, Json(json!({ "converged": ok, "live_aligned": live_aligned, "detail": detail })))
 }
 
+/// Registers this rig's demo application on every node, retrying each
+/// until it succeeds (a node might still be starting tailscaled when the
+/// logger comes up). /v1/register is plain JSON, not an encrypted
+/// envelope — it's how a key gets established in the first place — which
+/// is only safe to send here because these nodes run with
+/// --insecure-local-api on their own isolated Docker network, not on a
+/// real one. Without this, every node would 404 on the demo app forever:
+/// syncd no longer creates applications lazily, on purpose.
+async fn register_demo_app(l: Log, name: String, token: String, secret: String) {
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap();
+    let mut pending: std::collections::HashSet<String> = l.targets.iter().cloned().collect();
+    while !pending.is_empty() {
+        let mut done = Vec::new();
+        for t in &pending {
+            let body = json!({ "name": name, "token": token, "secret": secret });
+            match http.post(format!("http://{t}/v1/register")).json(&body).send().await {
+                Ok(r) if r.status().is_success() => {
+                    println!("[register] {t}: {name}/{token} ready");
+                    done.push(t.clone());
+                }
+                Ok(r) => eprintln!("[register] {t}: {} (retrying)", r.status()),
+                Err(e) => eprintln!("[register] {t}: {e} (retrying)"),
+            }
+        }
+        for t in done {
+            pending.remove(&t);
+        }
+        if !pending.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+}
+
 /// Polls the demo app's state on every node. The logger is the only thing that talks
 /// to all of them: the nodes don't know it exists, beyond blindly getting
 /// events pushed at them.
 async fn poller(l: Log) {
+    // Generous on purpose: a paused container (phase 2 of scenario.sh)
+    // still needs to time out reliably, but Docker's own bridge network
+    // and embedded DNS resolver occasionally add a second or so of
+    // latency to an otherwise-healthy request — a tighter timeout here
+    // flags a live node as unreachable on every such blip, which is what
+    // made the dashboard cycle between aligned/not-aligned with nothing
+    // actually wrong.
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(900))
+        .timeout(std::time::Duration::from_secs(3))
         .build()
         .unwrap();
     loop {
         for t in &l.targets {
             // all the network work BEFORE taking the lock: holding a
             // MutexGuard across an await would block the whole logger
+            let req_env = crypto::seal(&l.key, &json!({}));
             let fetched: Option<serde_json::Value> = match http
-                .get(format!("http://{t}/v1/{}/state", l.service_path))
+                .post(format!("http://{t}/v1/{}/state", l.service_path))
+                .json(&req_env)
                 .send()
                 .await
             {
-                Ok(r) => r.json::<serde_json::Value>().await.ok(),
+                Ok(r) => match r.json::<crypto::Envelope>().await {
+                    Ok(env) => crypto::open(&l.key, &env),
+                    Err(_) => None,
+                },
                 Err(_) => None,
             };
 
@@ -231,12 +282,14 @@ async fn index() -> Html<&'static str> {
 
 /// Forwards a device command to its node, over the internal Docker
 /// network. The UI only talks to the logger: no CORS to configure on the
-/// nodes, and the devices' ports stay an implementation detail.
+/// nodes, and the devices' ports stay an implementation detail. Plain
+/// JSON, unencrypted — only for the host-level endpoints (/v1/online)
+/// that have no per-application key to seal with.
 async fn proxy_post(l: &Log, id: &str, path: &str, body: serde_json::Value) -> Response {
     let target = { l.inner.lock().unwrap().target_of.get(id).cloned() };
     let Some(target) = target else { return StatusCode::NOT_FOUND.into_response() };
     let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(1500))
+        .timeout(std::time::Duration::from_secs(3))
         .build()
         .unwrap();
     match http.post(format!("http://{target}{path}")).json(&body).send().await {
@@ -247,13 +300,37 @@ async fn proxy_post(l: &Log, id: &str, path: &str, body: serde_json::Value) -> R
     }
 }
 
+/// Same as `proxy_post`, but for a per-application endpoint: seals `body`
+/// under the demo application's key before sending, and opens the node's
+/// response the same way, so the browser UI (which never sees the key)
+/// still gets plain JSON back.
+async fn proxy_post_encrypted(l: &Log, id: &str, path: &str, body: serde_json::Value) -> Response {
+    let target = { l.inner.lock().unwrap().target_of.get(id).cloned() };
+    let Some(target) = target else { return StatusCode::NOT_FOUND.into_response() };
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let req_env = crypto::seal(&l.key, &body);
+    match http.post(format!("http://{target}{path}")).json(&req_env).send().await {
+        Ok(r) => {
+            let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            match r.json::<crypto::Envelope>().await.ok().and_then(|env| crypto::open::<serde_json::Value>(&l.key, &env)) {
+                Some(v) => (status, Json(v)).into_response(),
+                None => status.into_response(),
+            }
+        }
+        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
 async fn device_write(
     State(l): State<Log>,
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let path = format!("/v1/{}/write", l.service_path);
-    proxy_post(&l, &id, &path, body).await
+    proxy_post_encrypted(&l, &id, &path, body).await
 }
 
 async fn device_online(
@@ -276,8 +353,21 @@ async fn main() {
     let service_name = std::env::var("SERVICE_NAME").unwrap_or_else(|_| "demo".into());
     let service_token = std::env::var("SERVICE_TOKEN").unwrap_or_else(|_| "v1".into());
     let service_path = format!("{service_name}/{service_token}");
+    // Obviously not a real secret: this is a demo rig, and the whole point
+    // of --insecure-local-api on the nodes (see docker-compose.yml) is
+    // that anyone on the Docker bridge network — including this logger —
+    // can register/write/read it anyway. A real deployment generates this
+    // once, out of band, and never puts it in an env var default.
+    let service_secret = std::env::var("SERVICE_SECRET").unwrap_or_else(|_| "demo-rig-not-a-real-secret".into());
+    let key = crypto::derive_key(&service_secret);
 
-    let log = Log { inner: Arc::new(Mutex::new(Inner::default())), targets: targets.clone(), service_path: service_path.clone() };
+    let log = Log {
+        inner: Arc::new(Mutex::new(Inner::default())),
+        targets: targets.clone(),
+        service_path: service_path.clone(),
+        key,
+    };
+    tokio::spawn(register_demo_app(log.clone(), service_name, service_token, service_secret));
     tokio::spawn(poller(log.clone()));
 
     let app = Router::new()

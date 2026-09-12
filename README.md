@@ -8,23 +8,24 @@ It runs once per machine. Any number of applications on that machine register wi
 
 ```mermaid
 flowchart LR
-    subgraph Laptop["Laptop"]
-        LP["passwords app"] -->|"/v1/passwords/&lt;token&gt;/write"| LSD["syncd :47100"]
-        LN["notes app"] -->|"/v1/notes/&lt;token&gt;/write"| LSD
+    subgraph Laptop["Laptop (loopback only)"]
+        LP["passwords app"] -->|"encrypted:<br/>/v1/passwords/&lt;token&gt;/write"| LSD["syncd :47100"]
+        LN["notes app"] -->|"encrypted:<br/>/v1/notes/&lt;token&gt;/write"| LSD
     end
-    subgraph Desktop["Desktop"]
+    subgraph Desktop["Desktop (loopback only)"]
         DSD["syncd :47100"]
         DP["passwords app"]
         DN["notes app"]
-        DSD -->|"/v1/passwords/&lt;token&gt;/state"| DP
-        DSD -->|"/v1/notes/&lt;token&gt;/state"| DN
+        DSD -->|"encrypted:<br/>/v1/passwords/&lt;token&gt;/state"| DP
+        DSD -->|"encrypted:<br/>/v1/notes/&lt;token&gt;/state"| DN
     end
-    LSD <-->|"anti-entropy sync<br/>tailnet / LAN / --bootstrap"| DSD
+    LSD <-->|"encrypted anti-entropy sync<br/>tailnet / LAN / --bootstrap"| DSD
 ```
 
 - **One syncd, many applications.** Each application (identified by a name + token, see "Registering an application" below) gets its own independent CRDT dataset. Applications never see each other's data, and syncd doesn't interpret any of it — to syncd, a value is an opaque string.
 - **No server, no leader.** Every syncd instance is identical; convergence comes from the CRDT merge rule (`src/core.rs`) plus a periodic anti-entropy loop, not from any device being authoritative. Two replicas that have seen the same ops always converge to the same state, regardless of the order those ops arrived in.
 - **Local-first.** Reads and writes against your own syncd never block on the network — see `/v1/online` below — a device can go fully offline and keep working, then reconcile automatically once it's back.
+- **Encrypted and authenticated, by secret, not certificate.** Every request and response for an application — local or peer-to-peer — is sealed with a key derived from a secret only that application's own devices know. See "Security model" below for exactly what this does and doesn't protect against.
 - **Discovery, layered.** Peers are found via tailscale (if present), a LAN broadcast announce/listen, an explicit `--bootstrap` list, and peer exchange (PEX) — see "Discovery beyond the tailnet" further down.
 
 ## Installing syncd
@@ -66,48 +67,68 @@ By default syncd listens on port **47100** and keeps every registered applicatio
 
 syncd runs once per machine, on one port, and hosts every application that wants to sync data through it side by side, without them interfering with each other.
 
-Two things identify an application to syncd:
+Three things identify and protect an application:
 
 - **name** — a short, stable identifier for the application itself, e.g. `passwords`.
 - **token** — a string the application's own developer controls, bumped whenever a change would make old and new data incompatible (a schema change, a breaking format change). **This is namespacing, not a secret** — don't rely on it for access control, and don't treat it as something to keep hidden from the application's own users.
+- **secret** — chosen once, out of band, by whoever pairs this application's devices (a random string, shared however the application's own UX wants — a QR code, manual entry, anything). **This is the actual secret.** Every device that will sync this application needs it; syncd only ever sees it during registration, on this one machine.
 
-Together, `(name, token)` selects one independent, replicated dataset: two installs of the same app with the same `(name, token)` sync with each other; bumping the token starts a fresh, separate dataset instead of two incompatible versions corrupting each other's data.
+`(name, token)` selects which independent, replicated dataset a request is about; `secret` proves the caller is allowed to read or write it. Two installs of the same app with the same `(name, token)` *and* `secret` sync with each other; bumping the token starts a fresh, separate dataset; a caller with the wrong secret gets rejected the same way a forged request would.
 
 Both `name` and `token` must be 1–64 characters of `[A-Za-z0-9_-]` — anything else is rejected with `400 Bad Request`. This keeps them safe to use both as a file name on disk (`~/.syncd/<name>.<token>.csv`) and as a URL path segment.
 
-### Handshake
+### Handshake (mandatory, local only)
 
 ```
 POST /v1/register
-{ "name": "passwords", "token": "9f86d081" }
+{ "name": "passwords", "token": "9f86d081", "secret": "<your paired secret>" }
 
 200 OK
 { "name": "passwords", "token": "9f86d081", "device_id": "laptop-1", "entries": 0, "vv": {} }
 ```
 
-Calling this isn't strictly required — every endpoint below creates the dataset the first time it's touched, whether that's a local call from your app or a peer syncing it in for the first time it's seen it — but it's the documented way to confirm you're talking to the right instance and see what's already there before writing anything.
+Unlike everything else below, this call is plain JSON, not an encrypted envelope — deriving the key from `secret` is the whole point of it, so there's nothing to encrypt with yet. That's only safe because **`/v1/register` only accepts loopback connections** (see "Security model"): the secret never has a reason to leave this machine.
+
+Calling this **is** required, once per machine, before anything else about `(name, token)` works: syncd no longer creates applications on first contact the way it briefly did — without a secret there's no key to encrypt or verify with, so a peer trying to sync in an application this machine never registered locally gets `404`, not a silently-seeded empty dataset. Registering again with the *same* secret is an idempotent confirmation; with a *different* secret it's refused (`409 Conflict`) rather than silently re-keying an application other devices already paired against.
 
 ### Reading and writing
 
-| Method | Path | Body | Returns |
+Every call below carries an **envelope** instead of its real payload — `{ "n": "<base64 nonce>", "ct": "<base64 ciphertext>" }` — sealed and opened with the key derived from `secret` (ChaCha20-Poly1305; see `src/crypto.rs`). The tables show the *plaintext* shape that travels inside the envelope.
+
+| Method | Path | Plaintext body | Plaintext response |
 |--------|------|------|---------|
 | POST | `/v1/{name}/{token}/write` | `{ "entity": "key", "value": "..." }` (or `"value": null` to delete) | `{ "seq": u64, "vv": {...} }` |
-| GET  | `/v1/{name}/{token}/state` | — | `{ "device", "entries": [{entity, value}, ...], "vv", "fingerprint", "online" }` |
+| POST | `/v1/{name}/{token}/state` | `{}` | `{ "device", "entries": [{entity, value}, ...], "vv", "fingerprint", "online" }` |
 
-`entity` is your application's own key — syncd doesn't interpret it, so an application can use flat keys, a JSON blob it serializes itself into the value, or anything else that fits in a string. Both endpoints work regardless of whether this node is currently "online" (see below): they're local calls to your own syncd, not peer-to-peer ones.
+`entity` is your application's own key — syncd doesn't interpret it, so an application can use flat keys, a JSON blob it serializes itself into the value, or anything else that fits in a string. Both endpoints work regardless of whether this node is currently "online" (see below), and both are **loopback-only**, same as `/v1/register`.
 
 ### What's host-level instead of per-application
 
-A few endpoints describe the *machine*, not any one application, and are intentionally not namespaced under `(name, token)`:
+A few endpoints describe the *machine*, not any one application, aren't namespaced under `(name, token)`, and carry no secret at all:
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET  | `/v1/node` | This machine's identity (`device_id`, `hostname`, `port`) plus every application currently registered on it |
-| POST | `/v1/online` | `{ "online": bool }` — flips the peer-to-peer surface for *every* registered application at once, the same way a laptop's network connection doesn't go offline one app at a time |
+| Method | Path | Loopback-only? | Purpose |
+|--------|------|-----------------|---------|
+| GET  | `/v1/node` | No | This machine's identity (`device_id`, `hostname`, `port`) plus every registered application's `name`/`token`/entry count/**fingerprint** — a one-way hash, so this is safe to leave unauthenticated: it proves agreement between nodes without revealing what they hold |
+| POST | `/v1/online` | Yes | `{ "online": bool }` — flips the peer-to-peer surface for *every* registered application at once, the same way a laptop's network connection doesn't go offline one app at a time |
 
-A device only has one identity and one online/offline state, shared by whatever's registered on it — that's also why running several independent sync groups no longer means running several syncd processes on one machine, the way it would have before this registry existed: one install, any number of applications.
+A device only has one identity and one online/offline state, shared by whatever's registered on it — that's also why running several independent sync groups no longer means running several syncd processes on one machine: one install, any number of applications, each with its own secret.
 
 The peer-to-peer wire protocol these endpoints (and the per-application ones above) sit on top of — the shapes another syncd, or a from-scratch client, actually speaks to reconcile state — is documented under "Integrating this layer into your own application" further down.
+
+## Security model
+
+**What's protected.** Every per-application request and response — local (write/state) or peer-to-peer (vv/ops/since/ops) — is an AEAD-sealed envelope (ChaCha20-Poly1305), keyed by SHA-256 of the application's `secret`. This gives confidentiality *and* authenticity in one step: there's no separate signature to check, because an envelope that opens successfully already proves the sender knew the secret, and one that doesn't (wrong secret, tampering, a forged request) is indistinguishable from noise and simply rejected (`401`). Two syncd instances — or a local client and its own syncd — that don't share a secret for a given `(name, token)` cannot read or write that dataset, even though the HTTP port itself is reachable to both.
+
+**Why a shared secret instead of TLS.** There's no PKI here: no certificates to generate, distribute, or pin across devices whose addresses change. Whoever pairs an application's devices shares one secret between them, once; that pairing UX is entirely the application's concern, not syncd's. On top of that, tailnet traffic is already inside tailscale's own WireGuard tunnel — a second layer of transport encryption on top would mostly protect against LAN-only deployments, which is exactly what the per-application encryption above already covers uniformly, tailnet or not.
+
+**Why `/v1/register`, `/v1/online`, and the write/state endpoints are loopback-only.** syncd's HTTP port binds `0.0.0.0` — it has to, that's how peers reach the sync endpoints — but nothing outside this machine should ever call these four. `/v1/register` carries a raw secret in the clear; the others are how *this machine's own* applications read and write their data. A middleware (`require_loopback` in `main.rs`) rejects any of the four from a non-loopback caller with `403`, regardless of which network interface the connection arrived on. Pass `--insecure-local-api` to turn this off — only for a deployment where "not loopback" doesn't mean "not trusted" (this repo's own Docker test rig, where the logger reaches nodes over an isolated bridge network — see docker-compose.yml). Don't pass it on a real install.
+
+**What's *not* protected:**
+
+- **The op log on disk is plaintext.** `~/.syncd/<name>.<token>.csv` holds decrypted values — the envelope protects data in transit, not at rest. If a dataset is genuinely sensitive (a password manager is the obvious case), the application itself should encrypt `value` before calling `/write` and decrypt it after `/state`; syncd never interprets `value`, so it will happily replicate ciphertext without ever seeing the plaintext.
+- **`/v1/node` and `/v1/peers` are unauthenticated.** Anyone who can reach the port sees this machine's hostname, device ID, and every registered application's `name`/`token`/entry count/fingerprint — never the actual data (see the table above), but it is metadata. `token` leaking here doesn't grant access to anything, since it was never the secret.
+- **No forward secrecy, no key rotation.** One secret, derived once, used for the life of the pairing. Rotating it means re-registering every device with a new one — there's no protocol for coordinating that rollover yet.
+- **The secret is only as good as how it's shared.** syncd has no part in that exchange; a weak or leaked secret is exactly as bad as a weak or leaked password would be, because that's what it is.
 
 ## Discovery beyond the tailnet
 
@@ -117,7 +138,7 @@ A node doesn't need tailscale to be found: alongside `tailscale status --json`, 
 
 ## Persistence
 
-Every registered application keeps its state in its own CSV file (`~/.syncd/<name>.<token>.csv` by default — override the root with `--data`).
+Every registered application keeps its state in its own CSV file (`~/.syncd/<name>.<token>.csv` by default — override the root with `--data`), plus a small sidecar `~/.syncd/<name>.<token>.key` holding the key derived from its secret at registration (mode `0600` on Unix) — that file is as sensitive as a password, since whoever reads it can decrypt and forge that application's traffic; it's what lets syncd resume an application across a restart without a local client re-supplying the secret every time (see "Security model" for what this key does and doesn't protect).
 
 The file isn't a snapshot of "current values" — it's a **log of operations**: one row per change, in the order it happened (`device,seq,entity,kind,value,hlc`), appended as it's accepted, never rewritten. What you actually read and write against at runtime is a `BTreeMap` kept in memory (`entries` in `src/core.rs`) — that's the fast part, O(log n) per lookup/insert. The CSV only exists so that map isn't lost when the process restarts: on startup, syncd finds every `<name>.<token>.csv` already on disk and replays each through the same `apply()` used for sync, rebuilding that application's in-memory map from scratch — so a registered application keeps syncing across a restart even before the application itself makes another request.
 
@@ -164,18 +185,19 @@ Keep the two invariants from the section above — idempotent/commutative merge,
 
 ### 2. Expose the sync endpoints, per application
 
-Two replicas reconcile by speaking four small endpoints, namespaced under the `(name, token)` of the application they're reconciling — see "Registering an application" above for what those mean. Add them to whatever HTTP server your app already runs — axum, actix-web, warp, a bare `TcpListener`, it doesn't matter — only the shapes matter:
+Two replicas reconcile by speaking three small endpoints, namespaced under the `(name, token)` of the application they're reconciling — see "Registering an application" above for what those mean, and "Security model" for the envelope every body/response below is actually wrapped in (`crypto::seal`/`crypto::open`, keyed by that application's secret — the shapes here are the *plaintext* carried inside). Add them to whatever HTTP server your app already runs — axum, actix-web, warp, a bare `TcpListener`, it doesn't matter — only the shapes matter:
 
-| Method | Path | Body | Returns |
+| Method | Path | Plaintext body | Plaintext response |
 |--------|------|------|---------|
-| GET    | `/v1/{name}/{token}/vv`         | —                            | your `VersionVector`                                            |
+| POST   | `/v1/{name}/{token}/vv`         | `{}`                          | your `VersionVector`                                            |
 | POST   | `/v1/{name}/{token}/ops/since`  | `{ "vv": VersionVector }`     | `{ "ops": [Op, ...] }` — ops you have that the caller is missing |
 | POST   | `/v1/{name}/{token}/ops`        | `{ "ops": [Op, ...] }`        | `{ "applied": usize, "vv": VersionVector }`                     |
-| POST   | `/v1/peers`                     | `{ "peers": [Peer, ...] }`    | the union of what you both know (host-level, PEX only — skip this one if you already have your own discovery) |
+
+`/v1/peers` (`{ "peers": [Peer, ...] }` → the union of what you both know) is separate: host-level, unencrypted, and PEX-only — skip it if you already have your own discovery. If you skip encryption entirely for your own reimplementation (e.g. an internal-only deployment), a peer expecting sealed envelopes simply won't be able to open what you send — there's no unencrypted fallback mode.
 
 ### 3. Drive it with a periodic sync round
 
-`sync_round()` in `main.rs` is the whole algorithm for one application, end to end: pull what the peer has that you don't (`/v1/{name}/{token}/ops/since`), push what you have that the peer doesn't (`/v1/{name}/{token}/ops`). It's about thirty lines and touches nothing from `core`/`discovery` beyond the `Op` type — copy it as-is and point it at whichever HTTP client your app already uses. Peer exchange (`exchange_peers()`) is separate and host-level: run it once per peer per tick, not once per application.
+`sync_round()` in `main.rs` is the whole algorithm for one application, end to end: pull what the peer has that you don't (`/v1/{name}/{token}/ops/since`), push what you have that the peer doesn't (`/v1/{name}/{token}/ops`) — sealing every request and opening every response with that application's key as it goes. It's about sixty lines and touches nothing from `core`/`discovery` beyond the `Op` type — copy it as-is and point it at whichever HTTP client your app already uses. Peer exchange (`exchange_peers()`) is separate, host-level, and unencrypted: run it once per peer per tick, not once per application.
 
 Spawn it on a timer (`tokio::spawn` plus `sleep` in this demo) against your list of known peer addresses, once per locally-registered application. Where those addresses come from is entirely up to you:
 
@@ -193,7 +215,7 @@ That's the entire surface. Nothing in `core.rs` or the wire protocol assumes axu
 
 ## The Docker Compose test rig
 
-Everything above is exercised end-to-end by a small Docker Compose rig in this repo: three syncd nodes on your real tailnet, sharing one demo application (`demo`/`v1`, see `docker-compose.yml`), plus a fourth container — the logger — that watches all three from outside the sync path and renders a live dashboard. It's how the claims above ("no leader", "reconverges automatically", "the logger isn't a dependency") get checked instead of just asserted.
+Everything above is exercised end-to-end by a small Docker Compose rig in this repo: three syncd nodes, sharing one demo application (`demo`/`v1`, see `docker-compose.yml`), plus a fourth container — the logger — that watches all three from outside the sync path and renders a live dashboard. It's how the claims above ("no leader", "reconverges automatically", "the logger isn't a dependency") get checked instead of just asserted.
 
 ```
 docker-compose.yml     3 nodes + logger
@@ -202,17 +224,16 @@ docker/entrypoint.sh    starts tailscaled if a TS_AUTHKEY is set
 scenario.sh             test sequence with automatic assertions
 ```
 
-No addresses are configured between the three nodes: they find each other by querying `tailscaled`, exactly as described above.
+No addresses are configured between the three nodes — they find each other with no `--bootstrap` at all, the same way any two real devices would. **`TS_AUTHKEY` is optional** (see `env.example`): set it and the three join your real tailnet and find each other by querying `tailscaled`, exactly as described above; leave it unset and `docker/entrypoint.sh` skips tailscale entirely, falling back to the LAN broadcast discovery from "Discovery beyond the tailnet" over the compose file's own bridge network — no tailscale account needed for a quick local run.
 
 ### Start
 
 ```bash
-cp env.example .env       # put your auth key in here
-docker compose up -d --build
+docker compose up -d --build     # no tailnet: nodes find each other over the bridge network
 open http://localhost:9000
 ```
 
-The auth key must be generated from the Admin console (Settings → Keys) as **Reusable** (three containers share it) and **Ephemeral** (nodes disappear from the tailnet when you stop the compose stack, instead of piling up).
+To run it on your real tailnet instead, `cp env.example .env`, uncomment `TS_AUTHKEY` and fill in a key generated from the Admin console (Settings → Keys) as **Reusable** (three containers share it) and **Ephemeral** (nodes disappear from the tailnet when you stop the compose stack, instead of piling up), then `docker compose up -d --build` the same way.
 
 Ports: `47101`, `47102`, `47103` for the three devices, `9000` for the logger.
 
@@ -234,7 +255,7 @@ Without it, `tailscaled` rewrites `/etc/resolv.conf` toward MagicDNS and the con
 
 ### The logger is not in the sync path
 
-It has no `TS_AUTHKEY`, doesn't join the tailnet, isn't a peer. It receives pushed events from the nodes (fire-and-forget, short timeout, every error ignored) and polls each node's `/v1/demo/v1/state` and edit endpoints over the Docker network.
+It has no `TS_AUTHKEY`, doesn't join the tailnet, isn't a peer. It receives pushed events from the nodes (fire-and-forget, short timeout, every error ignored) and polls each node's encrypted `/v1/demo/v1/state` and write endpoints over the Docker network — which it can only do because it holds the demo application's secret (`SERVICE_SECRET`, registered on all three nodes at its own startup) and because the nodes run with `--insecure-local-api` (see "Security model"): loopback-only would otherwise refuse a container reaching in over the Docker bridge.
 
 I ruled out the two alternatives for a specific reason. A fourth peer that quietly syncs would see the ops but not the exchanges between the other three. A proxy sitting in the traffic path would introduce exactly the central point this architecture denies, and would skew the timings you're trying to measure.
 
@@ -242,4 +263,4 @@ Phase 5 of the scenario turns the logger off, writes to a node, and checks that 
 
 ## What this rig doesn't prove
 
-It doesn't test the iOS client, which needs to run against a real node (see the PoC's own README). It doesn't test encryption, which doesn't exist yet: `payload` is plaintext and ops aren't signed — `token` (see "Registering an application") is namespacing, not access control, and doesn't change this. And it doesn't test compaction, because in a test session the op log never grows long enough to become a problem.
+It doesn't test the iOS client, which needs to run against a real node (see the PoC's own README). It doesn't test what happens with a wrong or leaked secret across real devices (see "Security model" for what that would and wouldn't expose), only that a mismatched secret fails to decrypt in isolation. And it doesn't test compaction, because in a test session the op log never grows long enough to become a problem.

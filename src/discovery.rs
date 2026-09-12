@@ -32,12 +32,21 @@ pub struct Peer {
     pub device_id: String,
 }
 
-/// One registered application, as reported by `/v1/node`.
+/// One registered application, as reported by `/v1/node`. `/v1/node` is
+/// unauthenticated and unencrypted (see main.rs) — deliberately, so a
+/// health check or a convergence check (comparing `fingerprint` across
+/// nodes, as the test rig's scenario.sh does once the logger is turned
+/// off) never needs the application's secret. `fingerprint` is a one-way
+/// hash of the live entries (see `Replica::state_fingerprint`): it proves
+/// two replicas agree or disagree without revealing what they actually
+/// hold, so this stays safe to expose even though the entries themselves
+/// are not.
 #[derive(Serialize)]
 pub struct ServiceInfo {
     pub name: String,
     pub token: String,
     pub entries: usize,
+    pub fingerprint: String,
 }
 
 /// A single syncd process now hosts every application registered on this

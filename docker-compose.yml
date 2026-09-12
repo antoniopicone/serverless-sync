@@ -1,19 +1,28 @@
-# Test rig: three devices on the real tailnet plus one observer.
+# Test rig: three devices plus one observer.
 #
 # The three nodes don't know about each other via configuration: no
-# --bootstrap, no address written down anywhere. They find each other by
-# querying tailscaled and filtering by hostname prefix.
+# --bootstrap, no address written down anywhere. TS_AUTHKEY is optional:
 #
-# Needs an ephemeral TS_AUTHKEY (Admin console, Settings, Keys):
-# check Ephemeral, so nodes disappear from the tailnet when you stop
-# the compose stack, and Reusable, since three containers share it.
+#   - set (copy env.example to .env): all three join your real tailnet
+#     and find each other by querying tailscaled, filtering by hostname
+#     prefix — this is the "syncd works over your tailnet" demo.
+#   - unset: entrypoint.sh skips tailscaled entirely (see its own
+#     comment) and the nodes fall back to LAN broadcast discovery
+#     (discovery::lan_discovery_loop) over this compose file's own
+#     `bench` bridge network, which behaves like any other LAN for that
+#     purpose — this is the "syncd works with no tailnet at all" demo,
+#     useful for a quick local run with no tailscale account needed.
+#
+# If you do set one, it needs to be ephemeral (Admin console, Settings,
+# Keys: check Ephemeral, so nodes disappear from the tailnet when you
+# stop the compose stack) and reusable (three containers share it).
 
 x-node: &node
   build:
     context: .
     dockerfile: Dockerfile
   environment: &node-env
-    TS_AUTHKEY: "${TS_AUTHKEY:?an auth key is required, copy env.example to .env}"
+    TS_AUTHKEY: "${TS_AUTHKEY:-}"
     SYNCD_PORT: "47100"
     TS_USERSPACE: "true"
   cap_add: [NET_ADMIN, NET_RAW]
@@ -44,6 +53,13 @@ services:
       - --interval=3
       - --telemetry=http://logger:9000/ev
       - --data=/data
+      # /v1/register, /v1/online, and the write/state endpoints are
+      # loopback-only by default (see main.rs); the logger reaches them
+      # over the Docker bridge network instead, which isn't loopback from
+      # a container's point of view. That's fine ONLY because this bridge
+      # network is otherwise empty and isolated — never pass this flag on
+      # a real install.
+      - --insecure-local-api
     volumes: ["data-a:/data"]
     ports: ["47101:47100"]
 
@@ -62,6 +78,7 @@ services:
       - --interval=3
       - --telemetry=http://logger:9000/ev
       - --data=/data
+      - --insecure-local-api           # see device-a's comment above
     volumes: ["data-b:/data"]
     ports: ["47102:47100"]
 
@@ -80,6 +97,7 @@ services:
       - --interval=3
       - --telemetry=http://logger:9000/ev
       - --data=/data
+      - --insecure-local-api           # see device-a's comment above
     volumes: ["data-c:/data"]
     ports: ["47103:47100"]
 
@@ -97,10 +115,13 @@ services:
       DEVICES: "device-a:47100,device-b:47100,device-c:47100"
       PORT: "9000"
       # Which registered application this rig demonstrates (see
-      # "Registering an application" in README.md) — the nodes don't need
-      # to know this themselves, they create it lazily on first contact.
+      # "Registering an application" in README.md). The logger registers
+      # it on all three nodes at startup (register_demo_app in logger.rs)
+      # since syncd no longer creates applications lazily. SERVICE_SECRET
+      # is a demo value on purpose — see logger.rs's own comment on it.
       SERVICE_NAME: "demo"
       SERVICE_TOKEN: "v1"
+      SERVICE_SECRET: "demo-rig-not-a-real-secret"
     ports: ["9000:9000"]
     networks: [bench]
     restart: unless-stopped

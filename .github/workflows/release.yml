@@ -5,13 +5,13 @@ name: Release
 # `install/install.ps1` have something to fetch without anyone building
 # from source.
 #
-# Triggers on version tags (v1.2.3) and can also be run by hand to produce
-# a draft build without cutting a release.
+# Triggers on any tag push and can also be run by hand to produce a build
+# without cutting a release (the publish step only runs for an actual tag).
 
 on:
   push:
     tags:
-      - "v*.*.*"
+      - "*"
   workflow_dispatch:
 
 permissions:
@@ -84,7 +84,7 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:

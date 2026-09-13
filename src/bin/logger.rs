@@ -1,17 +1,16 @@
-//! logger — observer for the test rig.
+//! logger — observer for the Docker demo (see docker-compose.yml).
 //!
-//! NOT a peer and NOT in the sync path. It does two things:
-//!   1. receives events pushed from the nodes (POST /ev) for the timeline;
-//!   2. polls each node's /v1/{name}/{token}/state for the authoritative
-//!      fingerprint, where {name}/{token} is this rig's own demo
-//!      application (SERVICE_NAME/SERVICE_TOKEN, default "demo"/"v1") —
-//!      see "Registering an application" in README.md for what those mean
-//!      to a real client.
+//! NOT a peer and NOT in the sync path: it never appears in any node's
+//! `--bootstrap`/peer list, and reaches the nodes only by polling their
+//! (normally loopback-only) `/state` and `/write` — which only works here
+//! because the demo nodes run with `--insecure-local-api` on an isolated
+//! Docker bridge network, not on a real one (see main.rs's own comment on
+//! that flag).
 //!
-//! The fingerprint is the signal: the same across all nodes means replicas
-//! are aligned, different means the merge has diverged. GET /api/assert
-//! returns 200 if converged and 409 if not, so the test scenario script
-//! can fail with an exit code instead of by eyeballing it.
+//! The fingerprint each node reports is the signal: the same across all
+//! nodes means replicas are aligned, different means the merge has
+//! diverged. GET /api/assert returns 200 if converged and 409 if not, so
+//! scenario.sh can fail with an exit code instead of by eyeballing it.
 
 use axum::{
     extract::{Path, State},
@@ -20,69 +19,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use syncd::crypto;
 
 const MAX_EVENTS: usize = 400;
-
-#[derive(Clone, Serialize)]
-struct Event {
-    seq: u64,
-    ts: u64,
-    device: String,
-    kind: String,
-    data: serde_json::Value,
-}
-
-#[derive(Clone, Serialize, Default)]
-struct DeviceState {
-    device: String,
-    fingerprint: String,
-    entries: Vec<serde_json::Value>,
-    vv: serde_json::Value,
-    reachable: bool,
-    /// State of the local switch (see /v1/online on the node), not
-    /// reachability: a device can be "offline" and stay perfectly
-    /// reachable and editable locally — that's the whole point of the
-    /// demo. Only its sync toward the others stops.
-    online: bool,
-    last_seen: u64,
-}
-
-#[derive(Default)]
-struct Inner {
-    events: VecDeque<Event>,
-    seq: u64,
-    devices: BTreeMap<String, DeviceState>,
-    /// polling target -> device name, learned on the first successful
-    /// poll. Needed to correctly attribute a failure: without it, a node
-    /// that stops responding stays marked reachable and the partition
-    /// doesn't show up.
-    by_target: BTreeMap<String, String>,
-    /// The reverse: device name -> network target. The UI only talks to
-    /// the logger (no CORS to configure on the nodes' ports); writes and
-    /// online toggles get forwarded to the right target through this map.
-    target_of: BTreeMap<String, String>,
-}
-
-#[derive(Clone)]
-struct Log {
-    inner: Arc<Mutex<Inner>>,
-    targets: Vec<String>,
-    /// "{name}/{token}" of this rig's own demo application — every
-    /// per-application syncd endpoint is namespaced under this, so the
-    /// logger (and scenario.sh) talk to one fixed (name, token) pair
-    /// instead of the flat /v1/* routes older versions of this rig used.
-    service_path: String,
-    /// Derived from SERVICE_SECRET: every per-application request/response
-    /// is an encrypted+authenticated envelope (see crypto.rs), so the
-    /// logger needs this to read a node's state or forward a write, the
-    /// same as any other client of the demo application would.
-    key: crypto::Key,
-}
 
 fn now() -> u64 {
     std::time::SystemTime::now()
@@ -91,29 +32,73 @@ fn now() -> u64 {
         .as_millis() as u64
 }
 
-#[derive(Deserialize)]
-struct EvIn {
+#[derive(Clone, serde::Serialize)]
+struct Event {
+    seq: u64,
+    ts: u64,
     device: String,
     kind: String,
-    #[serde(default)]
     data: serde_json::Value,
 }
 
-async fn ingest(State(l): State<Log>, Json(ev): Json<EvIn>) -> StatusCode {
-    let mut g = l.inner.lock().unwrap();
-    g.seq += 1;
-    let seq = g.seq;
-    g.events.push_front(Event {
-        seq,
-        ts: now(),
-        device: ev.device,
-        kind: ev.kind,
-        data: ev.data,
-    });
-    while g.events.len() > MAX_EVENTS {
-        g.events.pop_back();
+#[derive(Clone, serde::Serialize, Default)]
+struct DeviceState {
+    device: String,
+    fingerprint: String,
+    entries: Vec<serde_json::Value>,
+    vv: serde_json::Value,
+    reachable: bool,
+    /// The node's own `/v1/online` switch (see main.rs), not reachability:
+    /// a device can be "offline" and stay perfectly reachable and editable
+    /// locally — that's the whole point of the demo. Only its sync toward
+    /// the others stops.
+    online: bool,
+}
+
+#[derive(Default)]
+struct Inner {
+    devices: BTreeMap<String, DeviceState>,
+    /// polling target -> device name, learned on the first successful
+    /// poll. Needed to correctly attribute a failure: without it, a node
+    /// that stops responding stays marked reachable and the partition
+    /// doesn't show up.
+    by_target: BTreeMap<String, String>,
+    /// The reverse: device name -> network target. The UI only talks to
+    /// the logger (no CORS to configure on the nodes' ports); writes get
+    /// forwarded to the right target through this map.
+    target_of: BTreeMap<String, String>,
+    /// Synthesized by diffing each poll against the previous one (see
+    /// `poll_one`) — the logger never sees ops directly (it isn't in the
+    /// sync path), so this is reconstructed from before/after state
+    /// rather than pushed by the nodes.
+    events: VecDeque<Event>,
+    event_seq: u64,
+}
+
+impl Inner {
+    fn push_event(&mut self, device: &str, kind: &str, data: serde_json::Value) {
+        self.event_seq += 1;
+        self.events.push_front(Event { seq: self.event_seq, ts: now(), device: device.to_string(), kind: kind.to_string(), data });
+        while self.events.len() > MAX_EVENTS {
+            self.events.pop_back();
+        }
     }
-    StatusCode::NO_CONTENT
+}
+
+/// entity -> value, from a `/state` response's `entries` array — used to
+/// diff two snapshots down to per-entity write/delete events.
+fn entries_map(entries: &[serde_json::Value]) -> BTreeMap<String, String> {
+    entries.iter().filter_map(|e| {
+        let entity = e.get("entity")?.as_str()?.to_string();
+        let value = e.get("value")?.as_str()?.to_string();
+        Some((entity, value))
+    }).collect()
+}
+
+#[derive(Clone)]
+struct Log {
+    inner: Arc<Mutex<Inner>>,
+    targets: Vec<String>,
 }
 
 /// Green only if ALL known nodes respond and share the same fingerprint.
@@ -176,101 +161,99 @@ async fn api_assert(State(l): State<Log>) -> impl IntoResponse {
     (code, Json(json!({ "converged": ok, "live_aligned": live_aligned, "detail": detail })))
 }
 
-/// Registers this rig's demo application on every node, retrying each
-/// until it succeeds (a node might still be starting tailscaled when the
-/// logger comes up). /v1/register is plain JSON, not an encrypted
-/// envelope — it's how a key gets established in the first place — which
-/// is only safe to send here because these nodes run with
-/// --insecure-local-api on their own isolated Docker network, not on a
-/// real one. Without this, every node would 404 on the demo app forever:
-/// syncd no longer creates applications lazily, on purpose.
-async fn register_demo_app(l: Log, name: String, token: String, secret: String) {
-    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap();
-    let mut pending: std::collections::HashSet<String> = l.targets.iter().cloned().collect();
-    while !pending.is_empty() {
-        let mut done = Vec::new();
-        for t in &pending {
-            let body = json!({ "name": name, "token": token, "secret": secret });
-            match http.post(format!("http://{t}/v1/register")).json(&body).send().await {
-                Ok(r) if r.status().is_success() => {
-                    println!("[register] {t}: {name}/{token} ready");
-                    done.push(t.clone());
+/// Polls one target's `/state` and folds the result into shared state,
+/// diffing against whatever was cached for that device before this poll
+/// to synthesize events (see `Inner::events`) — connectivity flips, the
+/// `/v1/online` switch flipping, and per-entity writes/deletes. Shared by
+/// the background `poller` loop and by `device_write`/`device_online`
+/// (see below), which call this once, immediately, right after their own
+/// action completes — otherwise the dashboard would only pick up a just
+/// -made change on the *next* second-ly poll, and in the meantime could
+/// easily show some other, unrelated device's own next poll landing
+/// first, making the edit look like it "propagated to everyone else
+/// before showing on its own card".
+async fn poll_one(l: &Log, http: &reqwest::Client, t: &str) {
+    // all the network work BEFORE taking the lock: holding a MutexGuard
+    // across an await would block the whole logger
+    let fetched: Option<serde_json::Value> = match http.get(format!("http://{t}/state")).send().await {
+        Ok(r) => r.json::<serde_json::Value>().await.ok(),
+        Err(_) => None,
+    };
+
+    let mut g = l.inner.lock().unwrap();
+    match fetched {
+        Some(v) => {
+            let name = v.get("device").and_then(|d| d.as_str()).unwrap_or(t).to_string();
+            let fingerprint: String = v.get("fingerprint").and_then(|f| f.as_str()).unwrap_or("").into();
+            let entries: Vec<serde_json::Value> = v.get("entries").and_then(|e| e.as_array()).cloned().unwrap_or_default();
+            let online = v.get("online").and_then(|o| o.as_bool()).unwrap_or(true);
+            let vv = v.get("vv").cloned().unwrap_or(json!({}));
+
+            g.by_target.insert(t.to_string(), name.clone());
+            g.target_of.insert(name.clone(), t.to_string());
+
+            match g.devices.get(&name).cloned() {
+                None => {
+                    g.push_event(&name, "first-seen", json!({}));
                 }
-                Ok(r) => eprintln!("[register] {t}: {} (retrying)", r.status()),
-                Err(e) => eprintln!("[register] {t}: {e} (retrying)"),
+                Some(old) => {
+                    if !old.reachable {
+                        g.push_event(&name, "reachable", json!({}));
+                    }
+                    if old.online && !online {
+                        g.push_event(&name, "node.offline", json!({}));
+                    } else if !old.online && online {
+                        g.push_event(&name, "node.online", json!({}));
+                    }
+                    let old_map = entries_map(&old.entries);
+                    let new_map = entries_map(&entries);
+                    for (k, v) in &new_map {
+                        if old_map.get(k) != Some(v) {
+                            g.push_event(&name, "write", json!({ "entity": k, "value": v }));
+                        }
+                    }
+                    for k in old_map.keys() {
+                        if !new_map.contains_key(k) {
+                            g.push_event(&name, "delete", json!({ "entity": k }));
+                        }
+                    }
+                }
             }
+
+            g.devices.insert(name.clone(), DeviceState { device: name, fingerprint, entries, vv, reachable: true, online });
         }
-        for t in done {
-            pending.remove(&t);
-        }
-        if !pending.is_empty() {
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        None => {
+            // mark unreachable without deleting it: during a partition
+            // you still want to see its last fingerprint
+            if let Some(name) = g.by_target.get(t).cloned() {
+                let was_reachable = g.devices.get(&name).map(|d| d.reachable).unwrap_or(false);
+                if let Some(d) = g.devices.get_mut(&name) {
+                    d.reachable = false;
+                }
+                if was_reachable {
+                    g.push_event(&name, "unreachable", json!({}));
+                }
+            }
         }
     }
 }
 
-/// Polls the demo app's state on every node. The logger is the only thing that talks
-/// to all of them: the nodes don't know it exists, beyond blindly getting
-/// events pushed at them.
+/// Polls every node's `/state` once a second. The logger is the only
+/// thing that talks to all of them: the nodes don't know it exists.
 async fn poller(l: Log) {
     // Generous on purpose: a paused container (phase 2 of scenario.sh)
     // still needs to time out reliably, but Docker's own bridge network
     // and embedded DNS resolver occasionally add a second or so of
     // latency to an otherwise-healthy request — a tighter timeout here
-    // flags a live node as unreachable on every such blip, which is what
-    // made the dashboard cycle between aligned/not-aligned with nothing
-    // actually wrong.
+    // flags a live node as unreachable on every such blip, cycling the
+    // dashboard between aligned/not-aligned with nothing actually wrong.
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()
         .unwrap();
     loop {
         for t in &l.targets {
-            // all the network work BEFORE taking the lock: holding a
-            // MutexGuard across an await would block the whole logger
-            let req_env = crypto::seal(&l.key, &json!({}));
-            let fetched: Option<serde_json::Value> = match http
-                .post(format!("http://{t}/v1/{}/state", l.service_path))
-                .json(&req_env)
-                .send()
-                .await
-            {
-                Ok(r) => match r.json::<crypto::Envelope>().await {
-                    Ok(env) => crypto::open(&l.key, &env),
-                    Err(_) => None,
-                },
-                Err(_) => None,
-            };
-
-            let mut g = l.inner.lock().unwrap();
-            match fetched {
-                Some(v) => {
-                    let name = v.get("device").and_then(|d| d.as_str()).unwrap_or(t).to_string();
-                    g.by_target.insert(t.clone(), name.clone());
-                    g.target_of.insert(name.clone(), t.clone());
-                    g.devices.insert(
-                        name.clone(),
-                        DeviceState {
-                            device: name,
-                            fingerprint: v.get("fingerprint").and_then(|f| f.as_str()).unwrap_or("").into(),
-                            entries: v.get("entries").and_then(|e| e.as_array()).cloned().unwrap_or_default(),
-                            vv: v.get("vv").cloned().unwrap_or(json!({})),
-                            reachable: true,
-                            online: v.get("online").and_then(|o| o.as_bool()).unwrap_or(true),
-                            last_seen: now(),
-                        },
-                    );
-                }
-                None => {
-                    // mark unreachable without deleting it: during a
-                    // partition you still want to see its last fingerprint
-                    if let Some(name) = g.by_target.get(t).cloned() {
-                        if let Some(d) = g.devices.get_mut(&name) {
-                            d.reachable = false;
-                        }
-                    }
-                }
-            }
+            poll_one(&l, &http, t).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     }
@@ -280,18 +263,13 @@ async fn index() -> Html<&'static str> {
     Html(UI)
 }
 
-/// Forwards a device command to its node, over the internal Docker
-/// network. The UI only talks to the logger: no CORS to configure on the
-/// nodes, and the devices' ports stay an implementation detail. Plain
-/// JSON, unencrypted — only for the host-level endpoints (/v1/online)
-/// that have no per-application key to seal with.
+/// Forwards a command to its node, over the internal Docker network. The
+/// UI only talks to the logger: no CORS to configure on the nodes, and
+/// the devices' ports stay an implementation detail.
 async fn proxy_post(l: &Log, id: &str, path: &str, body: serde_json::Value) -> Response {
     let target = { l.inner.lock().unwrap().target_of.get(id).cloned() };
     let Some(target) = target else { return StatusCode::NOT_FOUND.into_response() };
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .unwrap();
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap();
     match http.post(format!("http://{target}{path}")).json(&body).send().await {
         Ok(r) => StatusCode::from_u16(r.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY)
@@ -300,27 +278,13 @@ async fn proxy_post(l: &Log, id: &str, path: &str, body: serde_json::Value) -> R
     }
 }
 
-/// Same as `proxy_post`, but for a per-application endpoint: seals `body`
-/// under the demo application's key before sending, and opens the node's
-/// response the same way, so the browser UI (which never sees the key)
-/// still gets plain JSON back.
-async fn proxy_post_encrypted(l: &Log, id: &str, path: &str, body: serde_json::Value) -> Response {
-    let target = { l.inner.lock().unwrap().target_of.get(id).cloned() };
-    let Some(target) = target else { return StatusCode::NOT_FOUND.into_response() };
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-        .unwrap();
-    let req_env = crypto::seal(&l.key, &body);
-    match http.post(format!("http://{target}{path}")).json(&req_env).send().await {
-        Ok(r) => {
-            let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            match r.json::<crypto::Envelope>().await.ok().and_then(|env| crypto::open::<serde_json::Value>(&l.key, &env)) {
-                Some(v) => (status, Json(v)).into_response(),
-                None => status.into_response(),
-            }
-        }
-        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+/// Re-polls one device right away, out of band from the once-a-second
+/// background loop — see `poll_one`'s doc comment for why this matters.
+async fn refresh_device(l: &Log, device_id: &str) {
+    let target = { l.inner.lock().unwrap().target_of.get(device_id).cloned() };
+    if let Some(t) = target {
+        let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap();
+        poll_one(l, &http, &t).await;
     }
 }
 
@@ -329,8 +293,9 @@ async fn device_write(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    let path = format!("/v1/{}/write", l.service_path);
-    proxy_post_encrypted(&l, &id, &path, body).await
+    let resp = proxy_post(&l, &id, "/write", body).await;
+    refresh_device(&l, &id).await;
+    resp
 }
 
 async fn device_online(
@@ -338,7 +303,9 @@ async fn device_online(
     Path(id): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
-    proxy_post(&l, &id, "/v1/online", body).await
+    let resp = proxy_post(&l, &id, "/v1/online", body).await;
+    refresh_device(&l, &id).await;
+    resp
 }
 
 #[tokio::main]
@@ -350,43 +317,26 @@ async fn main() {
         .filter(|s| !s.is_empty())
         .collect();
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(9000);
-    let service_name = std::env::var("SERVICE_NAME").unwrap_or_else(|_| "demo".into());
-    let service_token = std::env::var("SERVICE_TOKEN").unwrap_or_else(|_| "v1".into());
-    let service_path = format!("{service_name}/{service_token}");
-    // Obviously not a real secret: this is a demo rig, and the whole point
-    // of --insecure-local-api on the nodes (see docker-compose.yml) is
-    // that anyone on the Docker bridge network — including this logger —
-    // can register/write/read it anyway. A real deployment generates this
-    // once, out of band, and never puts it in an env var default.
-    let service_secret = std::env::var("SERVICE_SECRET").unwrap_or_else(|_| "demo-rig-not-a-real-secret".into());
-    let key = crypto::derive_key(&service_secret);
 
-    let log = Log {
-        inner: Arc::new(Mutex::new(Inner::default())),
-        targets: targets.clone(),
-        service_path: service_path.clone(),
-        key,
-    };
-    tokio::spawn(register_demo_app(log.clone(), service_name, service_token, service_secret));
+    let log = Log { inner: Arc::new(Mutex::new(Inner::default())), targets: targets.clone() };
     tokio::spawn(poller(log.clone()));
 
     let app = Router::new()
         .route("/", get(index))
-        .route("/ev", post(ingest))
         .route("/api/state", get(api_state))
         .route("/api/assert", get(api_assert))
         .route("/api/devices/:id/write", post(device_write))
         .route("/api/devices/:id/online", post(device_online))
         .with_state(log);
 
-    println!("logger on :{port}, watching {} for {service_path}", targets.join(" "));
+    println!("logger on :{port}, watching {}", targets.join(" "));
     let l = tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap();
     axum::serve(l, app).await.unwrap();
 }
 
 const UI: &str = r##"<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<title>syncd — test rig</title>
+<title>syncd — demo</title>
 <style>
   :root { --ink:#14181C; --muted:#667079; --line:#C9CFD3; --teal:#1B5E7E;
           --band:#DCEAF0; --paper:#F5F6F4; --warn:#8C5A20; --bad:#A03232; }
@@ -457,14 +407,14 @@ const UI: &str = r##"<!doctype html>
           border:1px solid var(--line); border-radius:6px; background:#fff; }
   ul.ev li { padding:6px 12px; border-bottom:1px solid #EEF1F2;
              font-family:ui-monospace,Menlo,monospace; font-size:12px; }
-  .k { display:inline-block; min-width:132px; color:var(--teal); }
+  .k { display:inline-block; min-width:110px; color:var(--teal); }
   .k.warn { color:var(--warn); }
   .d { color:var(--muted); }
   .who { display:inline-block; min-width:78px; font-weight:600; }
 </style></head><body>
 <header>
-  <h1>syncd — test rig</h1>
-  <div class="sub">Each card is an independent device: edit its entries, turn it off, and watch it work locally until it comes back online. The logger only observes: turn it off and the nodes keep syncing on their own.</div>
+  <h1>syncd — demo</h1>
+  <div class="sub">Each card is an independent device: edit its entries, and flip it offline with the switch to see it work locally while diverging from the others, then flip it back on and watch it reconverge with no manual reconciliation. That switch calls <code>/v1/online</code> on the node itself (see main.rs) — a real two-way partition of the sync surface, not a UI-only simulation. Pausing a container (see scenario.sh) is the other, blunter way to test this: it freezes the whole process, local reads and writes included, where the switch only stops syncing.</div>
 </header>
 <div id="verdict"><div class="big">waiting for nodes…</div><div class="det"></div></div>
 <main>
@@ -506,15 +456,11 @@ async function setOnline(device, online) {
 // While the user is typing in a text field, don't touch THAT card:
 // otherwise the poll every second would rip focus out from under their
 // fingers. This is deliberately per-device, not global: if only device-c's
-// card has focus, device-a and device-b must keep updating — otherwise
-// they'd sit frozen on an old (and maybe not-yet-converged) snapshot even
-// though they've genuinely already finished syncing. The online/offline
-// switch is deliberately excluded: it's a single click, not typing.
+// card has focus, device-a and device-b must keep updating. The
+// online/offline switch is deliberately excluded: it's a single click,
+// not typing, so there's no focus-stealing risk to guard against.
 const EDITABLE = '.v-input, .new-k, .new-v';
 let focusedDevice = null;
-// .new-k/.new-v don't carry data-device: it's on the <form class="add-form">
-// that contains them, so we walk up with closest (which also covers
-// .v-input, which already has it on itself).
 document.addEventListener('focusin', e => {
   if (e.target.matches(EDITABLE)) focusedDevice = e.target.closest('[data-device]')?.dataset.device ?? null;
 });
@@ -549,6 +495,14 @@ devs.addEventListener('submit', e => {
   if (!k) return;
   writeEntity(form.dataset.device, k, v);
   form.reset();
+  // form.reset() clears the fields' values but does NOT blur them, so
+  // .new-k/.new-v (still focused) would otherwise keep focusedDevice set
+  // to this device — the immediately-following tick() would then skip
+  // re-rendering exactly the card that was just edited (see syncDevices),
+  // making the edit appear to show up on every OTHER card before it shows
+  // up on its own.
+  if (document.activeElement) document.activeElement.blur();
+  focusedDevice = null;
 });
 devs.addEventListener('focusout', e => {
   if (e.target.matches('.v-input') && e.target.value !== e.target.dataset.orig) {
@@ -623,15 +577,15 @@ async function tick(){
   syncDevices(s.devices);
 
   document.getElementById('evs').innerHTML = s.events.map(e => {
-    const warn = (e.kind === 'peer.unreachable') ? ' warn' : '';
+    const warn = (e.kind === 'unreachable') ? ' warn' : '';
     let d = '';
-    if (e.kind === 'sync.ok') d = `+${e.data.pulled} received, +${e.data.pushed} sent  from ${e.data.peer}`;
-    else if (e.kind === 'op.local') d = `${e.data.entity}  seq ${e.data.seq}`;
-    else if (e.kind === 'state') d = `${e.data.fingerprint}  (${e.data.entries} entries)`;
-    else if (e.kind === 'peer.unreachable') d = e.data.peer;
-    else if (e.kind === 'node.start') d = e.data.advertise || '';
+    if (e.kind === 'write') d = `${e.data.entity} = ${e.data.value}`;
+    else if (e.kind === 'delete') d = `${e.data.entity} deleted`;
+    else if (e.kind === 'unreachable') d = 'stopped responding';
+    else if (e.kind === 'reachable') d = 'responding again';
     else if (e.kind === 'node.online') d = 'back online';
     else if (e.kind === 'node.offline') d = 'goes offline, working locally';
+    else if (e.kind === 'first-seen') d = 'first contact';
     else d = JSON.stringify(e.data);
     return `<li><span class="who">${esc(e.device)}</span><span class="k${warn}">${esc(e.kind)}</span><span class="d">${esc(d)}</span></li>`;
   }).join('');

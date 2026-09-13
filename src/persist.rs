@@ -110,64 +110,59 @@ impl OpLog {
     }
 }
 
-/// Where one registered application's log lives on disk: one file per
-/// (name, token) pair under the shared data root, so independent
-/// applications — and independent versions of the same one, once the
-/// token changes — never share a file.
-pub fn service_path(data_root: &Path, name: &str, token: &str) -> PathBuf {
-    data_root.join(format!("{name}.{token}.csv"))
+/// `~/.syncd` — a hidden per-user directory holding the ledger CSV plus
+/// the small sidecar files below (`port`, `device_id`). Falls back to the
+/// working directory if somehow neither $HOME nor %USERPROFILE% is set.
+/// A fork of this project should give its own copy a different name (see
+/// README's "Using this as a foundation") so two such daemons on the same
+/// machine never collide on one data directory.
+pub fn default_data_dir() -> PathBuf {
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".syncd")
 }
 
-/// Where one application's derived key (see `crypto::derive_key`) is
-/// cached on disk, so a device doesn't need its secret re-supplied by a
-/// local client on every restart — only the first time.
-pub fn key_path(data_root: &Path, name: &str, token: &str) -> PathBuf {
-    data_root.join(format!("{name}.{token}.key"))
+pub fn default_ledger_path() -> PathBuf {
+    default_data_dir().join("ledger.csv")
 }
 
-/// Persists a derived key, restricted to the owning user where the
-/// platform supports it (Unix mode 0600) — this file is as sensitive as a
-/// password, since anyone who reads it can decrypt and forge that
-/// application's traffic.
-pub fn save_key(path: &Path, key: &crate::crypto::Key) -> io::Result<()> {
-    fs::write(path, key)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+/// Where `serve` records the port it actually bound, so a client that
+/// wasn't told `--port` directly (e.g. a bridge process a host application
+/// spawns per-call, the way a browser spawns a Native Messaging host) can
+/// still find it.
+pub fn port_file_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("port")
 }
 
-/// Loads a previously saved key, if the file exists and has the right
-/// length; `Ok(None)` (not an error) if there's simply nothing there yet.
-pub fn load_key(path: &Path) -> io::Result<Option<crate::crypto::Key>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let bytes = fs::read(path)?;
-    let key: crate::crypto::Key = bytes
-        .try_into()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "key file has the wrong length"))?;
-    Ok(Some(key))
+pub fn write_port_file(data_dir: &Path, port: u16) -> io::Result<()> {
+    fs::create_dir_all(data_dir)?;
+    fs::write(port_file_path(data_dir), port.to_string())
 }
 
-/// Every (name, token) pair that already has a log on disk, discovered by
-/// listing the data root — used at startup to resume syncing applications
-/// that registered before the last restart without waiting for them to
-/// make a fresh request first. `name`/`token` are reconstructed by
-/// splitting the filename on its first `.`, which is unambiguous because
-/// both are restricted to `[A-Za-z0-9_-]` (see `main.rs::valid_key_part`)
-/// and so never contain a `.` themselves.
-pub fn known_services(data_root: &Path) -> Vec<(String, String)> {
-    let Ok(read_dir) = fs::read_dir(data_root) else { return Vec::new() };
-    read_dir
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let file_name = entry.file_name();
-            let stem = file_name.to_str()?.strip_suffix(".csv")?;
-            let (name, token) = stem.split_once('.')?;
-            Some((name.to_string(), token.to_string()))
-        })
-        .collect()
+/// Unused by this repo's own single-mode `main.rs` — provided for a fork
+/// that adds a second, short-lived process (a CLI, a browser's Native
+/// Messaging bridge) needing to find the long-running `serve` daemon's
+/// port without being told it directly.
+#[allow(dead_code)]
+pub fn read_port_file(data_dir: &Path) -> Option<u16> {
+    fs::read_to_string(port_file_path(data_dir)).ok()?.trim().parse().ok()
+}
+
+/// Path of this daemon's persistent device id, generated once (see
+/// `main.rs::resolve_device_id`) and reused across restarts — a device
+/// that changed its own id on every restart would look, from every peer's
+/// perspective, like an endless stream of brand new devices, each
+/// starting the anti-entropy conversation from scratch.
+pub fn device_id_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("device_id")
+}
+
+pub fn read_device_id(data_dir: &Path) -> Option<String> {
+    let s = fs::read_to_string(device_id_path(data_dir)).ok()?;
+    let s = s.trim();
+    if s.is_empty() { None } else { Some(s.to_string()) }
+}
+
+pub fn write_device_id(data_dir: &Path, device_id: &str) -> io::Result<()> {
+    fs::create_dir_all(data_dir)?;
+    fs::write(device_id_path(data_dir), device_id)
 }

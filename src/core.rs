@@ -140,6 +140,21 @@ impl Replica {
         self.observe(op.hlc);
         self.merge_entry(&op);
         self.vv.insert(op.device.clone(), op.seq);
+        // When the op being applied is one of THIS device's own — the case
+        // that matters is persist.rs replaying a device's past ops back
+        // through `apply` at startup, since that's the only entry point
+        // its replay uses — `self.seq` (the counter `local_change` mints
+        // the *next* local op from) must be bumped too. Left unfixed, a
+        // restart silently resets `seq` to 0 while `vv[device]` correctly
+        // reflects the true high-water mark; the first local write after
+        // that then reuses an already-used seq number and regresses
+        // `vv[device]`, which a peer that already synced past the real
+        // value reads as a stale duplicate and silently drops — real data
+        // loss. `local_change` still does its own `self.seq += 1`, so this
+        // only ever raises the floor, never invents a value.
+        if op.device == self.device {
+            self.seq = self.seq.max(op.seq);
+        }
         self.log.push(op);
         true
     }

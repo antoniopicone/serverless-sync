@@ -1,0 +1,13 @@
+[Unit]
+Description=__DESCRIPTION__
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=__BINARY_PATH__ __SERVE_ARG__
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

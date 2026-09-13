@@ -1,4 +1,7 @@
-# Test rig: three devices plus one observer.
+# Demo rig: three devices plus one observer, all running this repo's own
+# generic key/value fork of syncd (see main.rs's module doc comment) —
+# a stand-in for whatever real dataset a fork of this project would
+# actually sync.
 #
 # The three nodes don't know about each other via configuration: no
 # --bootstrap, no address written down anywhere. TS_AUTHKEY is optional:
@@ -51,14 +54,12 @@ services:
       - --port=47100
       - --peer-prefix=syncd-          # only probe this rig's own nodes
       - --interval=3
-      - --telemetry=http://logger:9000/ev
-      - --data=/data
-      # /v1/register, /v1/online, and the write/state endpoints are
-      # loopback-only by default (see main.rs); the logger reaches them
-      # over the Docker bridge network instead, which isn't loopback from
-      # a container's point of view. That's fine ONLY because this bridge
-      # network is otherwise empty and isolated — never pass this flag on
-      # a real install.
+      - --data=/data/ledger.csv
+      # /write and /state are loopback-only by default (see main.rs); the
+      # logger reaches them over the Docker bridge network instead, which
+      # isn't loopback from a container's point of view. That's fine ONLY
+      # because this bridge network is otherwise empty and isolated —
+      # never pass this flag on a real install.
       - --insecure-local-api
     volumes: ["data-a:/data"]
     ports: ["47101:47100"]
@@ -76,8 +77,7 @@ services:
       - --port=47100
       - --peer-prefix=syncd-
       - --interval=3
-      - --telemetry=http://logger:9000/ev
-      - --data=/data
+      - --data=/data/ledger.csv
       - --insecure-local-api           # see device-a's comment above
     volumes: ["data-b:/data"]
     ports: ["47102:47100"]
@@ -95,8 +95,7 @@ services:
       - --port=47100
       - --peer-prefix=syncd-
       - --interval=3
-      - --telemetry=http://logger:9000/ev
-      - --data=/data
+      - --data=/data/ledger.csv
       - --insecure-local-api           # see device-a's comment above
     volumes: ["data-c:/data"]
     ports: ["47103:47100"]
@@ -114,14 +113,6 @@ services:
     environment:
       DEVICES: "device-a:47100,device-b:47100,device-c:47100"
       PORT: "9000"
-      # Which registered application this rig demonstrates (see
-      # "Registering an application" in README.md). The logger registers
-      # it on all three nodes at startup (register_demo_app in logger.rs)
-      # since syncd no longer creates applications lazily. SERVICE_SECRET
-      # is a demo value on purpose — see logger.rs's own comment on it.
-      SERVICE_NAME: "demo"
-      SERVICE_TOKEN: "v1"
-      SERVICE_SECRET: "demo-rig-not-a-real-secret"
     ports: ["9000:9000"]
     networks: [bench]
     restart: unless-stopped
